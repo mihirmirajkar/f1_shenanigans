@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <LittleFS.h>
 
 // === CONFIG ===
 const int IR_PIN = 15;               // IR receiver OUT connected here
@@ -484,7 +485,21 @@ void handleRacePage() {
   <button class="btn-back" onclick="location.href='/'">Back to Quali</button>
 
   <script>
+    let previousPhase = "Idle";
+    const audio = new Audio('/lights_out_1.mp3');
+    audio.preload = 'auto';
+    
+    // Preload audio on page load
+    audio.load().catch(e => console.error("Audio load failed:", e));
+
     async function startRace() {
+      previousPhase = "Idle";
+      // Preload/ensure audio is ready after user interaction
+      try {
+        await audio.load();
+      } catch (e) {
+        console.error("Audio preload failed:", e);
+      }
       await fetch('/race_start');
       // force quick refresh
       setTimeout(fetchRaceStatus, 150);
@@ -497,6 +512,18 @@ void handleRacePage() {
 
         document.getElementById('raceStatus').innerText = data.phaseText;
         document.getElementById('countdown').innerText = data.display;
+
+        // Play audio when lights go out (transition to GO!)
+        if (data.phaseText === "GO!" && previousPhase !== "GO!") {
+          console.log("Lights out! Playing audio...");
+          audio.currentTime = 0; // Reset to start
+          audio.play().catch(e => {
+            console.error("Audio play failed:", e);
+            console.error("Audio readyState:", audio.readyState);
+          });
+        }
+
+        previousPhase = data.phaseText;
       } catch (e) {
         console.error(e);
       }
@@ -639,6 +666,18 @@ void handleRaceStatus() {
   server.send(200, "application/json", json);
 }
 
+// === API: Serve MP3 file ===
+void handleLightsOutMP3() {
+  File file = LittleFS.open("/lights_out_1.mp3", "r");
+  if (!file) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+  
+  server.streamFile(file, "audio/mpeg");
+  file.close();
+}
+
 // === SETUP & LOOP ===
 void setup() {
   Serial.begin(115200);
@@ -659,6 +698,13 @@ void setup() {
   allLightsOff();
   randomSeed(analogRead(0));
 
+  // Initialize LittleFS
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS Mount Failed");
+    return;
+  }
+  Serial.println("LittleFS mounted successfully");
+
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.println();
@@ -677,6 +723,7 @@ void setup() {
   server.on("/race", handleRacePage);
   server.on("/race_start", handleRaceStart);
   server.on("/race_status", handleRaceStatus);
+  server.on("/lights_out_1.mp3", handleLightsOutMP3);
 
   server.begin();
   Serial.println("HTTP server started.");
