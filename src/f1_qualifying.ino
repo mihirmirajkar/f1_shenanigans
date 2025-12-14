@@ -1,6 +1,11 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
+// Forward declarations for camera module helpers
+bool cameraIsActive();
+void cameraDeactivate();
+void resetCarTiming();
+
 // === CONFIG ===
 const int IR_PIN = 15;               // IR receiver OUT connected here
 const bool IR_BROKEN_IS_LOW = true;  // true if LOW means beam broken
@@ -115,6 +120,9 @@ void handleRoot() {
     racePhase = RACE_IDLE;
     allLightsOff();
   }
+
+  // Re-enable IR timing when leaving camera page
+  cameraDeactivate();
   
   String html = R"HTML(
 <!DOCTYPE html>
@@ -250,6 +258,7 @@ void handleRoot() {
 
   <h1>F1 Qualifying Timer</h1>
   <button class="btn-page" onclick="location.href='/race'">Go to Race Mode</button>
+  <button class="btn-page" onclick="location.href='/camera'">Go to Camera Mode</button>
 
   <div id="mode">Mode: ...</div>
   <button class="btn-mode" onclick="toggleMode()" id="modeButton">Toggle Mode</button>
@@ -402,6 +411,8 @@ void handleRoot() {
 
 // === HTML: Race Mode Page ===
 void handleRacePage() {
+  cameraDeactivate();  // race mode uses LEDs; re-enable IR if it was paused
+
   String html = R"HTML(
 <!DOCTYPE html>
 <html>
@@ -513,6 +524,7 @@ void handleRacePage() {
   server.send(200, "text/html", html);
 }
 
+
 // === API: Quali /status ===
 void handleStatus() {
   unsigned long now = millis();
@@ -560,6 +572,7 @@ void handleReset() {
   lastLapTime = 0;
   stopTime = 0;
   lapCount = 0;
+  resetCarTiming();
   server.send(200, "text/plain", "OK");
 }
 
@@ -586,6 +599,11 @@ void handleMode() {
   }
   server.send(200, "text/plain", "OK");
 }
+
+// === API: Camera lap ping ===
+void handleLapPing();
+void handleCarStatus();
+void handleCarConfig();
 
 // === API: Race Mode ===
 void handleRaceStart() {
@@ -644,6 +662,8 @@ void setup() {
   Serial.begin(115200);
   pinMode(IR_PIN, INPUT_PULLUP);
 
+  resetCarTiming();
+
   // LED pins
   for (int i = 0; i < NUM_LEDS; i++) {
     pinMode(leds[i], OUTPUT);
@@ -674,6 +694,11 @@ void setup() {
   server.on("/stop", handleStop);
   server.on("/mode", handleMode);
 
+  server.on("/camera", handleCameraPage);
+  server.on("/lap_ping", handleLapPing);
+  server.on("/car_status", handleCarStatus);
+  server.on("/car_config", handleCarConfig);
+
   server.on("/race", handleRacePage);
   server.on("/race_start", handleRaceStart);
   server.on("/race_status", handleRaceStatus);
@@ -693,7 +718,7 @@ void loop() {
   // This prevents qualifying timer from tracking times during race mode
   bool currentBroken = readBeamBroken();
 
-  if (racePhase == RACE_IDLE) {
+  if (!cameraIsActive() && racePhase == RACE_IDLE) {
     if (currentBroken && !prevBeamBroken) {
       if (now - lastTriggerTime > MIN_TRIGGER_GAP_MS) {
         lastTriggerTime = now;
