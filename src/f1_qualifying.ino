@@ -462,8 +462,9 @@ void handleRacePage() {
 
     .btn-start { background: #00c853; color: #fff; }
     .btn-back  { background: #1565c0; color: #fff; }
+    .btn-finish { background: #f44336; color: #fff; }
 
-    .btn-start:active, .btn-back:active {
+    .btn-start:active, .btn-back:active, .btn-finish:active {
       transform: scale(0.97);
     }
 
@@ -482,6 +483,7 @@ void handleRacePage() {
   <div id="countdown">--</div>
 
   <button class="btn-start" onclick="startRace()">Start</button>
+  <button class="btn-finish" onclick="finishRace()">Finish</button>
   <button class="btn-back" onclick="location.href='/'">Back to Quali</button>
 
   <audio id="goAudio" preload="auto">
@@ -491,6 +493,9 @@ void handleRacePage() {
     const goAudio = document.getElementById('goAudio');
     let lastPhase = '';
     let audioUnlocked = false;
+    let randomInterval = null;
+    let randomTimeout = null;
+    let isFinished = false;
 
     // Unlock audio on any user interaction (required for autoplay)
     document.addEventListener('click', function() {
@@ -529,11 +534,29 @@ void handleRacePage() {
 
         // Play audio when phase changes to GO!
         if (data.phaseText === 'GO!' && lastPhase !== 'GO!') {
+          isFinished = false;
+          // Clear any existing intervals/timeouts
+          if (randomInterval) {
+            clearInterval(randomInterval);
+            randomInterval = null;
+          }
+          if (randomTimeout) {
+            clearTimeout(randomTimeout);
+            randomTimeout = null;
+          }
           goAudio.currentTime = 0;
           goAudio.play().catch(e => console.log('Audio play failed:', e));
           setTimeout(() => {
+            if (isFinished) return;
             goAudio.src = '/turn_one_' + (Math.floor(Math.random() * 8) + 1) + '.mp3';
             goAudio.currentTime = 0;
+            goAudio.onended = () => {
+              if (isFinished) return;
+              randomTimeout = setTimeout(() => {
+                if (isFinished) return;
+                playRandom();
+              }, 15000);
+            };
             goAudio.play().catch(e => console.log('Turn audio play failed:', e));
           }, 3000);
         }
@@ -541,6 +564,34 @@ void handleRacePage() {
       } catch (e) {
         console.error('Fetch error:', e);
       }
+    }
+
+    function playRandom() {
+      if (isFinished) return;
+      goAudio.src = '/random_' + (Math.floor(Math.random() * 17) + 1) + '.mp3';
+      goAudio.currentTime = 0;
+      goAudio.onended = () => {
+        if (isFinished) return;
+        randomTimeout = setTimeout(() => {
+          if (isFinished) return;
+          playRandom();
+        }, 15000);
+      };
+      goAudio.play().catch(e => console.log('Random audio play failed:', e));
+    }
+
+    function finishRace() {
+      isFinished = true;
+      if (randomInterval) {
+        clearInterval(randomInterval);
+        randomInterval = null;
+      }
+      if (randomTimeout) {
+        clearTimeout(randomTimeout);
+        randomTimeout = null;
+      }
+      goAudio.onended = null;
+      goAudio.pause();
     }
 
     setInterval(fetchRaceStatus, 150);
@@ -747,6 +798,10 @@ void setup() {
     String route = "/lights_out_" + String(i) + ".mp3";
     server.on(route.c_str(), handleMP3);
     route = "/turn_one_" + String(i) + ".mp3";
+    server.on(route.c_str(), handleMP3);
+  }
+  for (int i = 1; i <= 17; i++) {
+    String route = "/random_" + String(i) + ".mp3";
     server.on(route.c_str(), handleMP3);
   }
 
