@@ -484,24 +484,38 @@ void handleRacePage() {
   <button class="btn-start" onclick="startRace()">Start</button>
   <button class="btn-back" onclick="location.href='/'">Back to Quali</button>
 
+  <audio id="goAudio" preload="auto">
+  </audio>
+
   <script>
-    let previousPhase = "Idle";
-    const audio = new Audio('/lights_out_1.mp3');
-    audio.preload = 'auto';
-    
-    // Preload audio on page load
-    audio.load().catch(e => console.error("Audio load failed:", e));
+    const goAudio = document.getElementById('goAudio');
+    let lastPhase = '';
+    let audioUnlocked = false;
+
+    // Unlock audio on any user interaction (required for autoplay)
+    document.addEventListener('click', function() {
+      if (!audioUnlocked) {
+        goAudio.play().then(() => {
+          goAudio.pause();
+          goAudio.currentTime = 0;
+          audioUnlocked = true;
+          console.log('Audio unlocked');
+        }).catch(e => console.log('Audio unlock failed:', e));
+      }
+    }, { once: true });
+
 
     async function startRace() {
-      previousPhase = "Idle";
-      // Preload/ensure audio is ready after user interaction
-      try {
-        await audio.load();
-      } catch (e) {
-        console.error("Audio preload failed:", e);
+      goAudio.src = '/lights_out_' + (Math.floor(Math.random() * 8) + 1) + '.mp3';
+      if (!audioUnlocked) {
+        try {
+          await goAudio.play();
+          goAudio.pause();
+          goAudio.currentTime = 0;
+          audioUnlocked = true;
+        } catch (e) {}
       }
       await fetch('/race_start');
-      // force quick refresh
       setTimeout(fetchRaceStatus, 150);
     }
 
@@ -513,19 +527,19 @@ void handleRacePage() {
         document.getElementById('raceStatus').innerText = data.phaseText;
         document.getElementById('countdown').innerText = data.display;
 
-        // Play audio when lights go out (transition to GO!)
-        if (data.phaseText === "GO!" && previousPhase !== "GO!") {
-          console.log("Lights out! Playing audio...");
-          audio.currentTime = 0; // Reset to start
-          audio.play().catch(e => {
-            console.error("Audio play failed:", e);
-            console.error("Audio readyState:", audio.readyState);
-          });
+        // Play audio when phase changes to GO!
+        if (data.phaseText === 'GO!' && lastPhase !== 'GO!') {
+          goAudio.currentTime = 0;
+          goAudio.play().catch(e => console.log('Audio play failed:', e));
+          setTimeout(() => {
+            goAudio.src = '/turn_one_' + (Math.floor(Math.random() * 8) + 1) + '.mp3';
+            goAudio.currentTime = 0;
+            goAudio.play().catch(e => console.log('Turn audio play failed:', e));
+          }, 3000);
         }
-
-        previousPhase = data.phaseText;
+        lastPhase = data.phaseText;
       } catch (e) {
-        console.error(e);
+        console.error('Fetch error:', e);
       }
     }
 
@@ -625,6 +639,22 @@ void handleRaceStart() {
   server.send(200, "text/plain", "OK");
 }
 
+// Serve MP3 file from LittleFS
+void handleMP3() {
+  File file = LittleFS.open(server.uri(), "r");
+  if (!file) {
+    Serial.println("ERROR: MP3 file not found in LittleFS");
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+  
+  Serial.println("Serving MP3 file");
+  server.sendHeader("Content-Type", "audio/mpeg");
+  server.sendHeader("Accept-Ranges", "bytes");
+  server.streamFile(file, "audio/mpeg");
+  file.close();
+}
+
 void handleRaceStatus() {
   unsigned long now = millis();
   String phaseText;
@@ -666,18 +696,6 @@ void handleRaceStatus() {
   server.send(200, "application/json", json);
 }
 
-// === API: Serve MP3 file ===
-void handleLightsOutMP3() {
-  File file = LittleFS.open("/lights_out_1.mp3", "r");
-  if (!file) {
-    server.send(404, "text/plain", "File not found");
-    return;
-  }
-  
-  server.streamFile(file, "audio/mpeg");
-  file.close();
-}
-
 // === SETUP & LOOP ===
 void setup() {
   Serial.begin(115200);
@@ -701,9 +719,9 @@ void setup() {
   // Initialize LittleFS
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS Mount Failed");
-    return;
+  } else {
+    Serial.println("LittleFS Mounted");
   }
-  Serial.println("LittleFS mounted successfully");
 
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
@@ -723,7 +741,14 @@ void setup() {
   server.on("/race", handleRacePage);
   server.on("/race_start", handleRaceStart);
   server.on("/race_status", handleRaceStatus);
-  server.on("/lights_out_1.mp3", handleLightsOutMP3);
+  
+  // Register routes for all MP3 files
+  for (int i = 1; i <= 8; i++) {
+    String route = "/lights_out_" + String(i) + ".mp3";
+    server.on(route.c_str(), handleMP3);
+    route = "/turn_one_" + String(i) + ".mp3";
+    server.on(route.c_str(), handleMP3);
+  }
 
   server.begin();
   Serial.println("HTTP server started.");
@@ -827,7 +852,7 @@ void loop() {
     }
 
     case RACE_GO_DONE:
-      // Stay here until next /race_start
+      // Audio is played in browser when UI shows "GO!"
       break;
   }
 }
