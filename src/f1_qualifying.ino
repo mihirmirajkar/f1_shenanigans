@@ -43,7 +43,7 @@ unsigned long lapTimes[MAX_LAPS];
 int lapCount = 0;
 
 // Modes: true = continuous, false = out-lap
-bool continuousMode = false;
+bool continuousMode = true;
 
 // Debounce for IR beam
 const unsigned long MIN_TRIGGER_GAP_MS = 500;
@@ -170,6 +170,13 @@ void handleRoot() {
       text-shadow: 0 0 12px rgba(0,255,127,0.7);
     }
 
+    #bestLap {
+      font-size: 6vw;
+      font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
+      color: #ffc107;
+      margin-bottom: 0.6em;
+    }
+
     #lastLap {
       font-size: 6vw;
       font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
@@ -245,6 +252,18 @@ void handleRoot() {
     .lap-index { width: 20%; text-align: left; }
     .lap-time  { width: 80%; text-align: right; }
 
+    @media (min-width: 900px) {
+      h1           { font-size: 2.5rem; }
+      #mode        { font-size: 1.3rem; }
+      #status      { font-size: 1.2rem; }
+      #currentTime { font-size: 5rem; }
+      #bestLap     { font-size: 1.8rem; }
+      #lastLap     { font-size: 1.8rem; }
+      button       { font-size: 1.1rem; }
+      .laps-title  { font-size: 1.2rem; }
+      th, td       { font-size: 1rem; }
+    }
+
   </style>
 </head>
 <body>
@@ -257,6 +276,7 @@ void handleRoot() {
 
   <div id="status">Status: ...</div>
 
+  <div id="bestLap">Best: --:--.---</div>
   <div id="currentTime">00:00.000</div>
   <div id="lastLap">Last: --:--.---</div>
 
@@ -283,7 +303,7 @@ void handleRoot() {
     let lastServerUpdateAtClientMs = 0;
     let serverStatusText = "WAITING";
     let serverLapTimes = [];
-    let serverMode = "outlap";
+    let serverMode = "continuous";
 
     function formatTime(ms) {
       const totalSeconds = Math.floor(ms / 1000);
@@ -348,6 +368,14 @@ void handleRoot() {
 
         document.getElementById('status').innerText = "Status: " + serverStatusText;
 
+        // Calculate and display best lap
+        if (serverLapTimes.length > 0) {
+          const bestLapMs = Math.min(...serverLapTimes);
+          document.getElementById('bestLap').innerText = "Best: " + formatTime(bestLapMs);
+        } else {
+          document.getElementById('bestLap').innerText = "Best: --:--.---";
+        }
+
         if (serverLastLapMs > 0) {
           document.getElementById('lastLap').innerText = "Last: " + formatTime(serverLastLapMs);
         } else {
@@ -380,6 +408,7 @@ void handleRoot() {
       serverLapTimes = [];
       serverRunning = false;
       document.getElementById('currentTime').innerText = formatTime(0);
+      document.getElementById('bestLap').innerText = "Best: --:--.---";
       document.getElementById('lastLap').innerText = "Last: --:--.---";
       renderLaps();
     }
@@ -580,7 +609,7 @@ void handleRacePage() {
       goAudio.play().catch(e => console.log('Random audio play failed:', e));
     }
 
-    function finishRace() {
+    async function finishRace() {
       isFinished = true;
       if (randomInterval) {
         clearInterval(randomInterval);
@@ -592,6 +621,8 @@ void handleRacePage() {
       }
       goAudio.onended = null;
       goAudio.pause();
+      await fetch('/race_finish');
+      setTimeout(fetchRaceStatus, 150);
     }
 
     setInterval(fetchRaceStatus, 150);
@@ -687,6 +718,13 @@ void handleRaceStart() {
   raceCountdownStartMs = millis();
   racePhaseStartMs = raceCountdownStartMs;
   raceRandomWaitMs = 0;
+  server.send(200, "text/plain", "OK");
+}
+
+void handleRaceFinish() {
+  // Reset race phase to IDLE
+  allLightsOff();
+  racePhase = RACE_IDLE;
   server.send(200, "text/plain", "OK");
 }
 
@@ -792,6 +830,7 @@ void setup() {
   server.on("/race", handleRacePage);
   server.on("/race_start", handleRaceStart);
   server.on("/race_status", handleRaceStatus);
+  server.on("/race_finish", handleRaceFinish);
   
   // Register routes for all MP3 files
   for (int i = 1; i <= 8; i++) {
