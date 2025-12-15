@@ -9,6 +9,7 @@ void resetCarTiming();
 // === CONFIG ===
 const int IR_PIN = 15;               // IR receiver OUT connected here
 const bool IR_BROKEN_IS_LOW = true;  // true if LOW means beam broken
+const unsigned long MIN_LAP_MS = 4000;  // ignore laps shorter than this
 
 // Wi-Fi AP config
 const char* AP_SSID = "F1-Quali-Timer";
@@ -731,7 +732,14 @@ void loop() {
         } else if (timerRunning) {
           stopTime = now;
           lastLapTime = stopTime - lapStartTime;
-          addLapTime(lastLapTime);
+
+          if (lastLapTime >= MIN_LAP_MS) {
+            addLapTime(lastLapTime);
+          } else {
+            Serial.println("Lap ignored: under minimum time.");
+            // keep lapStartTime unchanged to continue timing
+            continue;  // skip mode handling below
+          }
 
           if (continuousMode) {
             lapStartTime = now;

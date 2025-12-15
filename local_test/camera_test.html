@@ -1,235 +1,11 @@
-#include <WebServer.h>
-
-extern WebServer server;
-extern const int MAX_LAPS;
-String formatTime(unsigned long ms);
-
-// Camera-based multi-car tracking (phone browser does the vision)
-const int MAX_CARS = 6;  // hard limit to keep memory small
-const unsigned long MIN_CAMERA_TRIGGER_GAP_MS = 500;  // debounce per car; keep the first hit within this window
-const unsigned long MIN_LAP_MS = 0;                   // no server-side lap floor; rely on client gating
-
-static bool cameraModeActive = false;
-static int carCount = 2;  // configurable from UI
-
-static String carIds[MAX_CARS];
-static String carLabels[MAX_CARS];
-static String carColors[MAX_CARS];
-
-static unsigned long carLapTimes[MAX_CARS][MAX_LAPS];
-static unsigned long carLastLapMs[MAX_CARS];
-static unsigned long carLapStartMs[MAX_CARS];
-static int carLapCount[MAX_CARS];
-static bool carStartedOnce[MAX_CARS];
-static bool carTimerRunning[MAX_CARS];
-static unsigned long lastCameraTriggerMs[MAX_CARS];
-static const int MAX_COLOR_DISTANCE = 110;  // stricter color match threshold
-
-static const char* DEFAULT_COLORS[MAX_CARS] = {
-  "#ff4d4f", "#4dabff", "#6fdd8b", "#ffb347", "#d17bff", "#ffd166"
-};
-
-static void assignDefaults() {
-  for (int i = 0; i < MAX_CARS; i++) {
-    carIds[i] = "car" + String(i + 1);
-    carLabels[i] = "Car " + String(i + 1);
-    carColors[i] = DEFAULT_COLORS[i % 6];
-  }
-}
-
-static void clampCarCount(int requested) {
-  carCount = requested;
-  if (carCount < 1) carCount = 1;
-  if (carCount > MAX_CARS) carCount = MAX_CARS;
-}
-
-void resetCarTiming() {
-  for (int i = 0; i < MAX_CARS; i++) {
-    carLastLapMs[i] = 0;
-    carLapStartMs[i] = 0;
-    carLapCount[i] = 0;
-    carStartedOnce[i] = false;
-    carTimerRunning[i] = false;
-    lastCameraTriggerMs[i] = 0;
-    for (int j = 0; j < MAX_LAPS; j++) {
-      carLapTimes[i][j] = 0;
-    }
-  }
-}
-
-bool cameraIsActive() { return cameraModeActive; }
-void cameraDeactivate() { cameraModeActive = false; }
-
-static int findCarIndex(const String& carId) {
-  for (int i = 0; i < carCount; i++) {
-    if (carIds[i].equalsIgnoreCase(carId)) return i;
-  }
-  return -1;
-}
-
-static void addLapTimeForCar(int carIdx, unsigned long ms) {
-  for (int i = MAX_LAPS - 1; i > 0; i--) {
-    carLapTimes[carIdx][i] = carLapTimes[carIdx][i - 1];
-  }
-  carLapTimes[carIdx][0] = ms;
-  if (carLapCount[carIdx] < MAX_LAPS) carLapCount[carIdx]++;
-}
-
-static void splitCsv(const String& csv, String out[], int maxItems, int& outCount) {
-  outCount = 0;
-  int start = 0;
-  while (start < (int)csv.length() && outCount < maxItems) {
-    int comma = csv.indexOf(',', start);
-    if (comma < 0) comma = csv.length();
-    String token = csv.substring(start, comma);
-    token.trim();
-    out[outCount++] = token;
-    start = comma + 1;
-  }
-}
-
-static void applyCarConfig(int newCount, String names[], String colors[], int namesCount, int colorsCount) {
-  clampCarCount(newCount);
-  for (int i = 0; i < carCount; i++) {
-    carIds[i] = "car" + String(i + 1);
-    if (i < namesCount && names[i].length() > 0) {
-      carLabels[i] = names[i];
-    } else {
-      carLabels[i] = "Car " + String(i + 1);
-    }
-    if (i < colorsCount && colors[i].length() > 0) {
-      carColors[i] = colors[i];
-    } else {
-      carColors[i] = DEFAULT_COLORS[i % 6];
-    }
-  }
-  resetCarTiming();
-}
-
-void handleLapPing() {
-  cameraModeActive = true;  // keep IR disabled while camera is in use
-
-  if (!server.hasArg("car")) {
-    server.send(400, "text/plain", "Missing car");
-    return;
-  }
-
-  int idx = findCarIndex(server.arg("car"));
-  if (idx < 0) {
-    server.send(404, "text/plain", "Unknown car");
-    return;
-  }
-
-  unsigned long now = millis();
-  if (now - lastCameraTriggerMs[idx] < MIN_CAMERA_TRIGGER_GAP_MS) {
-    server.send(200, "text/plain", "IGNORED");
-    return;
-  }
-  lastCameraTriggerMs[idx] = now;
-
-  if (!carStartedOnce[idx]) {
-    carStartedOnce[idx] = true;
-    carTimerRunning[idx] = true;
-    carLapStartMs[idx] = now;
-    server.send(200, "text/plain", "STARTED");
-    return;
-  }
-
-  if (carTimerRunning[idx]) {
-    unsigned long lap = now - carLapStartMs[idx];
-    carLastLapMs[idx] = lap;
-    addLapTimeForCar(idx, lap);  // keep recent laps for display
-    carLapStartMs[idx] = now;
-    server.send(200, "text/plain", "LAP");
-  } else {
-    carTimerRunning[idx] = true;
-    carLapStartMs[idx] = now;
-    server.send(200, "text/plain", "RESUMED");
-  }
-}
-
-void handleCarStatus() {
-  String json = "{";
-  json += "\"count\":" + String(carCount) + ",";
-  json += "\"cars\":[";
-  for (int i = 0; i < carCount; i++) {
-    json += "{";
-    json += "\"id\":\"" + carIds[i] + "\",";
-    json += "\"label\":\"" + carLabels[i] + "\",";
-    json += "\"color\":\"" + carColors[i] + "\",";
-    json += "\"lastLapMs\":" + String(carLastLapMs[i]) + ",";
-    json += "\"lastLapMsFormatted\":\"" + formatTime(carLastLapMs[i]) + "\",";
-    json += "\"laps\":[";
-    for (int j = 0; j < carLapCount[i]; j++) {
-      json += "{\"ms\":" + String(carLapTimes[i][j]) + ",\"formatted\":\"" + formatTime(carLapTimes[i][j]) + "\"}";
-      if (j < carLapCount[i] - 1) json += ",";
-    }
-    json += "]";
-    json += "}";
-    if (i < carCount - 1) json += ",";
-  }
-  json += "]";
-  json += "}";
-
-  server.send(200, "application/json", json);
-}
-
-void handleCarConfig() {
-  if (server.method() == HTTP_GET) {
-    String json = "{";
-    json += "\"maxCars\":" + String(MAX_CARS) + ",";
-    json += "\"count\":" + String(carCount) + ",";
-    json += "\"cars\":[";
-    for (int i = 0; i < carCount; i++) {
-      json += "{\"id\":\"" + carIds[i] + "\",\"label\":\"" + carLabels[i] + "\",\"color\":\"" + carColors[i] + "\"}";
-      if (i < carCount - 1) json += ",";
-    }
-    json += "]";
-    json += "}";
-    server.send(200, "application/json", json);
-    return;
-  }
-
-  // Accept POST/any with query args: count, names(csv), colors(csv)
-  int newCount = carCount;
-  if (server.hasArg("count")) {
-    newCount = server.arg("count").toInt();
-  }
-
-  String namesCsv = server.hasArg("names") ? server.arg("names") : "";
-  String colorsCsv = server.hasArg("colors") ? server.arg("colors") : "";
-
-  String names[MAX_CARS];
-  String colors[MAX_CARS];
-  int namesCount = 0;
-  int colorsCount = 0;
-  splitCsv(namesCsv, names, MAX_CARS, namesCount);
-  splitCsv(colorsCsv, colors, MAX_CARS, colorsCount);
-
-  applyCarConfig(newCount, names, colors, namesCount, colorsCount);
-  server.send(200, "text/plain", "OK");
-}
-
-// === HTML: Camera-Based Multi-Car Tracking Page ===
-void handleCameraPage() {
-  cameraModeActive = true;  // pause IR processing while using camera mode
-
-  String html = R"HTML(
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Camera Lap Tracker</title>
+  <title>Camera Lap Tracker (Local Test)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <style>
-    body {
-      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-      background: #0d1117;
-      color: #e6edf3;
-      margin: 0;
-      padding: 12px;
-      text-align: center;
-    }
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: #0d1117; color: #e6edf3; margin: 0; padding: 12px; text-align: center; }
     h1 { margin: 0.2em 0 0.1em; }
     .hint { color: #8b949e; font-size: 0.95rem; }
     .controls { margin: 0.5em auto 0.6em; max-width: 940px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
@@ -255,8 +31,8 @@ void handleCameraPage() {
   </style>
 </head>
 <body>
-  <h1>Camera Lap Tracker</h1>
-  <div class="hint">Mount phone above start/finish. Set car count, names, colors; align the ROI band over the line. Keep lighting steady.</div>
+  <h1>Camera Lap Tracker (Local Test)</h1>
+  <div class="hint">Runs fully in browser against a mocked backend. Allow camera, align the band, move colored objects through it.</div>
 
   <div class="controls">
     <div class="card" style="flex: 1 1 300px; min-width: 260px;">
@@ -299,7 +75,7 @@ void handleCameraPage() {
   </div>
 
   <div style="margin: 0.5em auto 0.2em; max-width: 940px; text-align: left;" class="hint">
-    Tip: set phone focus/exposure manually if possible. Keep the finish line inside the colored band. Use bright, distinct sticker colors.
+    Tip: allow camera on localhost, keep the finish line inside the band, and use bright, distinct sticker colors.
   </div>
 
   <div id="log"></div>
@@ -314,6 +90,7 @@ void handleCameraPage() {
   <script>
     let carProfiles = [];
     let maxCars = 6;
+    const MAX_COLOR_DISTANCE = 110;  // stricter color match threshold to reduce wrong assignments
 
     const video = document.getElementById('video');
     const canvas = document.getElementById('canvas');
@@ -334,7 +111,7 @@ void handleCameraPage() {
     const saveCarsBtn = document.getElementById('saveCars');
     const restartBtn = document.getElementById('restartRace');
 
-    const MIN_LAP_GAP_MS = 4000; // client-side guard to match server filter
+    const MIN_LAP_GAP_MS = 4000; // match server min lap filter
 
     let bgFrame = null;
     let lastGlobalHit = 0;
@@ -373,12 +150,8 @@ void handleCameraPage() {
           <button class="small alt" data-idx="${idx}" data-dir="down">↓</button>
         `;
         const [nameInput, colorInput, upBtn, downBtn] = row.querySelectorAll('input, button');
-        nameInput.addEventListener('input', (e) => {
-          carProfiles[idx].label = e.target.value;
-        });
-        colorInput.addEventListener('input', (e) => {
-          carProfiles[idx].color = e.target.value;
-        });
+        nameInput.addEventListener('input', (e) => { carProfiles[idx].label = e.target.value; });
+        colorInput.addEventListener('input', (e) => { carProfiles[idx].color = e.target.value; });
         upBtn.addEventListener('click', () => moveCar(idx, -1));
         downBtn.addEventListener('click', () => moveCar(idx, 1));
         container.appendChild(row);
@@ -403,9 +176,7 @@ void handleCameraPage() {
         const n = carProfiles.length + 1;
         carProfiles.push({ id: `car${n}`, label: `Car ${n}`, color: '#ff4d4f', lastHit: 0, lastLapSent: 0 });
       }
-      while (carProfiles.length > desired) {
-        carProfiles.pop();
-      }
+      while (carProfiles.length > desired) carProfiles.pop();
       rebuildCarList();
     }
 
@@ -418,6 +189,7 @@ void handleCameraPage() {
       body.set('colors', colors);
       await fetch('/car_config', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
       log('Saved car names/colors.');
+      fetchCarStatus();
     }
 
     function drawBand(w, h) {
@@ -468,7 +240,7 @@ void handleCameraPage() {
       let motionPixels = 0;
       let sumR = 0, sumG = 0, sumB = 0;
 
-      const stride = 8; // sample every 2 pixels horizontally
+      const stride = 8;
       for (let i = 0; i < data.length; i += stride) {
         const dr = Math.abs(data[i] - bgFrame[i]);
         const dg = Math.abs(data[i + 1] - bgFrame[i + 1]);
@@ -518,35 +290,38 @@ void handleCameraPage() {
     function loop() {
       const res = processFrame();
       if (res && carProfiles.length) {
-        const { motionPixels, avg } = res;
-        const threshold = Number(motionPx.value);
-        if (motionPixels > threshold && avg) {
-          const now = performance.now();
-          if (now - lastGlobalHit > 500) {
-            const car = chooseCar(avg);
-            if (car && now - (car.lastHit || 0) > 500 && now - (car.lastLapSent || 0) > MIN_LAP_GAP_MS) {
-              if (!pendingCar || pendingCar.id !== car.id || now - pendingAt > CONFIRM_WINDOW_MS) {
-                pendingCar = car;
-                pendingAt = now;
-                pendingCount = 1;
-              } else {
-                pendingCount += 1;
-                if (pendingCount >= 2) {
-                  car.lastHit = now;
-                  car.lastLapSent = now;
-                  lastGlobalHit = now;
-                  pendingCar = null;
-                  pendingCount = 0;
-                  log(`Motion ${motionPixels} → ${car.label}`);
-                  sendLap(car);
+          const { motionPixels, avg } = res;
+          const threshold = Number(motionPx.value);
+          if (motionPixels > threshold && avg) {
+            const now = performance.now();
+            if (now - lastGlobalHit > 500) {
+              const car = chooseCar(avg);
+              if (car && now - (car.lastHit || 0) > 500 && now - (car.lastLapSent || 0) > MIN_LAP_GAP_MS) {
+                if (!pendingCar || pendingCar.id !== car.id || now - pendingAt > CONFIRM_WINDOW_MS) {
+                  pendingCar = car;
+                  pendingAt = now;
+                  pendingCount = 1;
+                } else {
+                  pendingCount += 1;
+                  if (pendingCount >= 2) {
+                    car.lastHit = now;
+                    car.lastLapSent = now;
+                    lastGlobalHit = now;
+                    pendingCar = null;
+                    pendingCount = 0;
+                    log(`Motion ${motionPixels} → ${car.label}`);
+                    sendLap(car);
+                  }
                 }
+              } else {
+                pendingCar = null;
+                pendingCount = 0;
               }
-            } else {
-              pendingCar = null;
-              pendingCount = 0;
             }
+          } else {
+            pendingCar = null;
+            pendingCount = 0;
           }
-        }
       }
       requestAnimationFrame(loop);
     }
@@ -601,8 +376,6 @@ void handleCameraPage() {
     }
 
     setInterval(fetchCarStatus, 600);
-    fetchCarStatus();
-
     resetBgBtn.addEventListener('click', () => { bgFrame = null; log('Background reset. Hold cars still.'); });
     applyCountBtn.addEventListener('click', applyCount);
     saveCarsBtn.addEventListener('click', () => { saveCars(); fetchCarStatus(); });
@@ -613,19 +386,10 @@ void handleCameraPage() {
     diffThr.addEventListener('input', updateSliderLabels);
 
     loadConfig().then(() => {
+      fetchCarStatus();
       updateSliderLabels();
       startCamera();
     });
   </script>
-
 </body>
 </html>
-)HTML";
-
-  server.send(200, "text/html", html);
-}
-
-// Ensure defaults are set once at startup
-struct CameraInitHook {
-  CameraInitHook() { assignDefaults(); resetCarTiming(); }
-} cameraInitHook;
