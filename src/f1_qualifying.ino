@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <LittleFS.h>
 
 // === CONFIG ===
 const int IR_PIN = 15;               // IR receiver OUT connected here
@@ -42,7 +43,7 @@ unsigned long lapTimes[MAX_LAPS];
 int lapCount = 0;
 
 // Modes: true = continuous, false = out-lap
-bool continuousMode = false;
+bool continuousMode = true;
 
 // Debounce for IR beam
 const unsigned long MIN_TRIGGER_GAP_MS = 500;
@@ -169,6 +170,13 @@ void handleRoot() {
       text-shadow: 0 0 12px rgba(0,255,127,0.7);
     }
 
+    #bestLap {
+      font-size: 6vw;
+      font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
+      color: #ffc107;
+      margin-bottom: 0.6em;
+    }
+
     #lastLap {
       font-size: 6vw;
       font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
@@ -244,6 +252,18 @@ void handleRoot() {
     .lap-index { width: 20%; text-align: left; }
     .lap-time  { width: 80%; text-align: right; }
 
+    @media (min-width: 900px) {
+      h1           { font-size: 2.5rem; }
+      #mode        { font-size: 1.3rem; }
+      #status      { font-size: 1.2rem; }
+      #currentTime { font-size: 5rem; }
+      #bestLap     { font-size: 1.8rem; }
+      #lastLap     { font-size: 1.8rem; }
+      button       { font-size: 1.1rem; }
+      .laps-title  { font-size: 1.2rem; }
+      th, td       { font-size: 1rem; }
+    }
+
   </style>
 </head>
 <body>
@@ -256,6 +276,7 @@ void handleRoot() {
 
   <div id="status">Status: ...</div>
 
+  <div id="bestLap">Best: --:--.---</div>
   <div id="currentTime">00:00.000</div>
   <div id="lastLap">Last: --:--.---</div>
 
@@ -282,7 +303,7 @@ void handleRoot() {
     let lastServerUpdateAtClientMs = 0;
     let serverStatusText = "WAITING";
     let serverLapTimes = [];
-    let serverMode = "outlap";
+    let serverMode = "continuous";
 
     function formatTime(ms) {
       const totalSeconds = Math.floor(ms / 1000);
@@ -347,6 +368,14 @@ void handleRoot() {
 
         document.getElementById('status').innerText = "Status: " + serverStatusText;
 
+        // Calculate and display best lap
+        if (serverLapTimes.length > 0) {
+          const bestLapMs = Math.min(...serverLapTimes);
+          document.getElementById('bestLap').innerText = "Best: " + formatTime(bestLapMs);
+        } else {
+          document.getElementById('bestLap').innerText = "Best: --:--.---";
+        }
+
         if (serverLastLapMs > 0) {
           document.getElementById('lastLap').innerText = "Last: " + formatTime(serverLastLapMs);
         } else {
@@ -379,6 +408,7 @@ void handleRoot() {
       serverLapTimes = [];
       serverRunning = false;
       document.getElementById('currentTime').innerText = formatTime(0);
+      document.getElementById('bestLap').innerText = "Best: --:--.---";
       document.getElementById('lastLap').innerText = "Last: --:--.---";
       renderLaps();
     }
@@ -461,8 +491,9 @@ void handleRacePage() {
 
     .btn-start { background: #00c853; color: #fff; }
     .btn-back  { background: #1565c0; color: #fff; }
+    .btn-finish { background: #f44336; color: #fff; }
 
-    .btn-start:active, .btn-back:active {
+    .btn-start:active, .btn-back:active, .btn-finish:active {
       transform: scale(0.97);
     }
 
@@ -481,12 +512,44 @@ void handleRacePage() {
   <div id="countdown">--</div>
 
   <button class="btn-start" onclick="startRace()">Start</button>
+  <button class="btn-finish" onclick="finishRace()">Finish</button>
   <button class="btn-back" onclick="location.href='/'">Back to Quali</button>
 
+  <audio id="goAudio" preload="auto">
+  </audio>
+
   <script>
+    const goAudio = document.getElementById('goAudio');
+    let lastPhase = '';
+    let audioUnlocked = false;
+    let randomInterval = null;
+    let randomTimeout = null;
+    let isFinished = false;
+
+    // Unlock audio on any user interaction (required for autoplay)
+    document.addEventListener('click', function() {
+      if (!audioUnlocked) {
+        goAudio.play().then(() => {
+          goAudio.pause();
+          goAudio.currentTime = 0;
+          audioUnlocked = true;
+          console.log('Audio unlocked');
+        }).catch(e => console.log('Audio unlock failed:', e));
+      }
+    }, { once: true });
+
+
     async function startRace() {
+      goAudio.src = '/lights_out_' + (Math.floor(Math.random() * 8) + 1) + '.mp3';
+      if (!audioUnlocked) {
+        try {
+          await goAudio.play();
+          goAudio.pause();
+          goAudio.currentTime = 0;
+          audioUnlocked = true;
+        } catch (e) {}
+      }
       await fetch('/race_start');
-      // force quick refresh
       setTimeout(fetchRaceStatus, 150);
     }
 
@@ -497,9 +560,69 @@ void handleRacePage() {
 
         document.getElementById('raceStatus').innerText = data.phaseText;
         document.getElementById('countdown').innerText = data.display;
+
+        // Play audio when phase changes to GO!
+        if (data.phaseText === 'GO!' && lastPhase !== 'GO!') {
+          isFinished = false;
+          // Clear any existing intervals/timeouts
+          if (randomInterval) {
+            clearInterval(randomInterval);
+            randomInterval = null;
+          }
+          if (randomTimeout) {
+            clearTimeout(randomTimeout);
+            randomTimeout = null;
+          }
+          goAudio.currentTime = 0;
+          goAudio.play().catch(e => console.log('Audio play failed:', e));
+          setTimeout(() => {
+            if (isFinished) return;
+            goAudio.src = '/turn_one_' + (Math.floor(Math.random() * 8) + 1) + '.mp3';
+            goAudio.currentTime = 0;
+            goAudio.onended = () => {
+              if (isFinished) return;
+              randomTimeout = setTimeout(() => {
+                if (isFinished) return;
+                playRandom();
+              }, 15000);
+            };
+            goAudio.play().catch(e => console.log('Turn audio play failed:', e));
+          }, 3000);
+        }
+        lastPhase = data.phaseText;
       } catch (e) {
-        console.error(e);
+        console.error('Fetch error:', e);
       }
+    }
+
+    function playRandom() {
+      if (isFinished) return;
+      goAudio.src = '/random_' + (Math.floor(Math.random() * 17) + 1) + '.mp3';
+      goAudio.currentTime = 0;
+      goAudio.onended = () => {
+        if (isFinished) return;
+        randomTimeout = setTimeout(() => {
+          if (isFinished) return;
+          playRandom();
+        }, 15000);
+      };
+      goAudio.play().catch(e => console.log('Random audio play failed:', e));
+    }
+
+    async function finishRace() {
+      isFinished = true;
+      if (randomInterval) {
+        clearInterval(randomInterval);
+        randomInterval = null;
+      }
+      if (randomTimeout) {
+        clearTimeout(randomTimeout);
+        randomTimeout = null;
+      }
+      goAudio.onended = null;
+      goAudio.pause();
+      await fetch('/race_finish');
+      setTimeout(fetchRaceStatus, 150);
     }
 
     setInterval(fetchRaceStatus, 150);
@@ -598,6 +721,29 @@ void handleRaceStart() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleRaceFinish() {
+  // Reset race phase to IDLE
+  allLightsOff();
+  racePhase = RACE_IDLE;
+  server.send(200, "text/plain", "OK");
+}
+
+// Serve MP3 file from LittleFS
+void handleMP3() {
+  File file = LittleFS.open(server.uri(), "r");
+  if (!file) {
+    Serial.println("ERROR: MP3 file not found in LittleFS");
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+  
+  Serial.println("Serving MP3 file");
+  server.sendHeader("Content-Type", "audio/mpeg");
+  server.sendHeader("Accept-Ranges", "bytes");
+  server.streamFile(file, "audio/mpeg");
+  file.close();
+}
+
 void handleRaceStatus() {
   unsigned long now = millis();
   String phaseText;
@@ -659,6 +805,13 @@ void setup() {
   allLightsOff();
   randomSeed(analogRead(0));
 
+  // Initialize LittleFS
+  if (!LittleFS.begin(true)) {
+    Serial.println("LittleFS Mount Failed");
+  } else {
+    Serial.println("LittleFS Mounted");
+  }
+
   WiFi.mode(WIFI_AP);
   WiFi.softAP(AP_SSID, AP_PASS);
   Serial.println();
@@ -677,6 +830,19 @@ void setup() {
   server.on("/race", handleRacePage);
   server.on("/race_start", handleRaceStart);
   server.on("/race_status", handleRaceStatus);
+  server.on("/race_finish", handleRaceFinish);
+  
+  // Register routes for all MP3 files
+  for (int i = 1; i <= 8; i++) {
+    String route = "/lights_out_" + String(i) + ".mp3";
+    server.on(route.c_str(), handleMP3);
+    route = "/turn_one_" + String(i) + ".mp3";
+    server.on(route.c_str(), handleMP3);
+  }
+  for (int i = 1; i <= 17; i++) {
+    String route = "/random_" + String(i) + ".mp3";
+    server.on(route.c_str(), handleMP3);
+  }
 
   server.begin();
   Serial.println("HTTP server started.");
@@ -780,7 +946,7 @@ void loop() {
     }
 
     case RACE_GO_DONE:
-      // Stay here until next /race_start
+      // Audio is played in browser when UI shows "GO!"
       break;
   }
 }
