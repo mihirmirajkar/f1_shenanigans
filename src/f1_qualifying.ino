@@ -44,10 +44,14 @@ unsigned long lapTimes[MAX_LAPS];
 int lapCount = 0;
 // === Race lap timing by barcode (slit count) ===
 const int MAX_RACE_CARS = 6;
+const int MAX_RACE_LAPS_PER_CAR = 20;
 uint16_t raceLapCount[MAX_RACE_CARS] = {0};
 unsigned long raceLastCrossMs[MAX_RACE_CARS] = {0};
-unsigned long raceLastLapMs[MAX_RACE_CARS] = {0};
-unsigned long raceBestLapMs[MAX_RACE_CARS] = {0};
+unsigned long raceLapTimes[MAX_RACE_CARS][MAX_RACE_LAPS_PER_CAR]; // Store all lap times
+
+int raceTargetLaps = 5;     // Target laps to complete (default 5)
+int raceWinnerCar = 0;      // 0 = no winner yet, 1-6 = winning car
+unsigned long raceWinTimeMs = 0; // Time when winner finished
 
 volatile int lastDetectedCar = 0;        // 1..6
 volatile int lastDetectedSlits = -1;     // 0..5
@@ -55,8 +59,7 @@ volatile unsigned long lastDetectedAtMs = 0;
 
 // Barcode/slit decoder tuning
 const uint32_t BARCODE_END_GAP_US = 30000;     // how long beam must stay clear to consider "frame ended"
-const uint32_t BARCODE_EDGE_DEBOUNCE_US = 300; // ignore faster edges (noise)
-const uint32_t MIN_SLIT_CLEAR_US = 1200;      // clear must last at least this long to count as a slit (filters noise)
+const uint32_t BARCODE_EDGE_DEBOUNCE_US = 200; // ignore faster edges (noise) - reduced for faster sampling
 const unsigned long MIN_RACE_LAP_MS = 1500;    // ignore faster laps / double-counts
 
 
@@ -117,9 +120,12 @@ void resetRaceStats() {
   for (int i = 0; i < MAX_RACE_CARS; i++) {
     raceLapCount[i] = 0;
     raceLastCrossMs[i] = 0;
-    raceLastLapMs[i] = 0;
-    raceBestLapMs[i] = 0;
+    for (int j = 0; j < MAX_RACE_LAPS_PER_CAR; j++) {
+      raceLapTimes[i][j] = 0;
+    }
   }
+  raceWinnerCar = 0;
+  raceWinTimeMs = 0;
   lastDetectedCar = 0;
   lastDetectedSlits = -1;
   lastDetectedAtMs = 0;
@@ -159,11 +165,12 @@ void handleRoot() {
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-      background: radial-gradient(circle at top, #202020 0, #000 55%);
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
       color: #f5f5f5;
       text-align: center;
       margin: 0;
       padding: 16px;
+      min-height: 100vh;
     }
 
     h1 {
@@ -173,7 +180,8 @@ void handleRoot() {
       text-transform: uppercase;
       letter-spacing: 0.15em;
       font-weight: 900;
-      color: #ffeb3b;
+      color: #ff0050;
+      text-shadow: 0 0 20px rgba(255,0,80,0.5), 0 4px 6px rgba(0,0,0,0.3);
     }
 
     #mode {
@@ -198,8 +206,12 @@ void handleRoot() {
       font-weight: 900;
       letter-spacing: 0.06em;
       color: #00ff7f;
-      margin: 0.05em 0;
-      text-shadow: 0 0 12px rgba(0,255,127,0.7);
+      margin: 0.15em 0;
+      text-shadow: 0 0 30px rgba(0,255,127,0.8), 0 0 60px rgba(0,255,127,0.4);
+      background: rgba(0,255,127,0.05);
+      padding: 0.2em 0.3em;
+      border-radius: 0.15em;
+      border: 2px solid rgba(0,255,127,0.2);
     }
 
     #bestLap {
@@ -218,30 +230,59 @@ void handleRoot() {
 
     button {
       font-size: 4vw;
-      padding: 0.45em 0.9em;
-      margin: 0.25em;
-      border-radius: 0.4em;
-      border: none;
+      padding: 0.55em 1.1em;
+      margin: 0.3em;
+      border-radius: 0.5em;
+      border: 2px solid transparent;
       cursor: pointer;
       font-weight: 800;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.1em;
+      transition: all 0.2s ease;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
     }
 
-    .btn-reset { background: #f44336; color: #fff; }
-    .btn-stop  { background: #ffc107; color: #000; }
-    .btn-mode  { background: #424242; color: #fff; width: 70%; }
-    .btn-page  { background: #1565c0; color: #fff; width: 70%; }
+    .btn-reset { 
+      background: linear-gradient(135deg, #ff0050 0%, #d50032 100%);
+      color: #fff;
+      border-color: #ff0050;
+    }
+    .btn-stop { 
+      background: linear-gradient(135deg, #ffd700 0%, #ffb700 100%);
+      color: #000;
+      border-color: #ffd700;
+    }
+    .btn-mode { 
+      background: linear-gradient(135deg, #536976 0%, #292e49 100%);
+      color: #fff;
+      width: 70%;
+      border-color: #536976;
+    }
+    .btn-page { 
+      background: linear-gradient(135deg, #0575e6 0%, #021b79 100%);
+      color: #fff;
+      width: 70%;
+      border-color: #0575e6;
+    }
 
-    .btn-reset:active, .btn-stop:active, .btn-mode:active, .btn-page:active {
-      transform: scale(0.97);
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+    }
+
+    button:active {
+      transform: translateY(0) scale(0.98);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.3);
     }
 
     .laps-container {
       max-width: 480px;
       margin: 0.8em auto 0;
-      padding-top: 0.4em;
-      border-top: 1px solid rgba(255,255,255,0.15);
+      padding: 1em;
+      border-top: 2px solid rgba(255,0,80,0.3);
+      background: rgba(0,0,0,0.2);
+      border-radius: 0.8em;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
     }
 
     .laps-title {
@@ -502,11 +543,12 @@ void handleRacePage() {
   <style>
     body {
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-      background: radial-gradient(circle at top, #202020 0, #000 55%);
+      background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%);
       color: #f5f5f5;
       text-align: center;
       margin: 0;
       padding: 16px;
+      min-height: 100vh;
     }
 
     h1 {
@@ -516,7 +558,8 @@ void handleRacePage() {
       text-transform: uppercase;
       letter-spacing: 0.18em;
       font-weight: 900;
-      color: #ffeb3b;
+      color: #ff0050;
+      text-shadow: 0 0 25px rgba(255,0,80,0.6), 0 4px 8px rgba(0,0,0,0.4);
     }
 
     #raceStatus {
@@ -534,27 +577,51 @@ void handleRacePage() {
       font-weight: 900;
       color: #ff5252;
       margin: 0.2em 0;
-      text-shadow: 0 0 14px rgba(255,82,82,0.8);
+      text-shadow: 0 0 40px rgba(255,82,82,1), 0 0 80px rgba(255,82,82,0.5);
+      background: rgba(255,82,82,0.08);
+      padding: 0.15em 0.3em;
+      border-radius: 0.1em;
+      border: 3px solid rgba(255,82,82,0.3);
     }
 
     button {
       font-size: 5vw;
-      padding: 0.5em 1em;
+      padding: 0.6em 1.2em;
       margin: 0.4em;
-      border-radius: 0.4em;
-      border: none;
+      border-radius: 0.5em;
+      border: 2px solid transparent;
       cursor: pointer;
       font-weight: 800;
       text-transform: uppercase;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.1em;
+      transition: all 0.2s ease;
+      box-shadow: 0 6px 16px rgba(0,0,0,0.4);
     }
 
-    .btn-start { background: #00c853; color: #fff; }
-    .btn-back  { background: #1565c0; color: #fff; }
-    .btn-finish { background: #f44336; color: #fff; }
+    .btn-start { 
+      background: linear-gradient(135deg, #00e676 0%, #00c853 100%);
+      color: #fff;
+      border-color: #00e676;
+    }
+    .btn-back { 
+      background: linear-gradient(135deg, #0575e6 0%, #021b79 100%);
+      color: #fff;
+      border-color: #0575e6;
+    }
+    .btn-finish { 
+      background: linear-gradient(135deg, #ff0050 0%, #d50032 100%);
+      color: #fff;
+      border-color: #ff0050;
+    }
 
-    .btn-start:active, .btn-back:active, .btn-finish:active {
-      transform: scale(0.97);
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    }
+
+    button:active {
+      transform: translateY(0) scale(0.98);
+      box-shadow: 0 3px 10px rgba(0,0,0,0.3);
     }
 
     @media (min-width: 900px) {
@@ -573,16 +640,24 @@ th { background: rgba(255,255,255,0.08); }
 <body>
 
   <h1>F1 Race Start</h1>
+  
+  <div style="margin: 12px auto; max-width: 400px;">
+    <label style="font-size: 16px; color: #29b6f6; margin-right: 10px;">Target Laps:</label>
+    <input type="number" id="targetLaps" value="5" min="1" max="50" 
+           style="width: 80px; padding: 8px; font-size: 18px; border-radius: 6px; border: 2px solid #0575e6; background: #1a1a2e; color: #fff; text-align: center;">
+    <button onclick="setTargetLaps()" style="padding: 8px 16px; font-size: 14px; margin-left: 10px;">Set</button>
+  </div>
+  
+  <div id="winnerDisplay" style="display:none; margin: 16px auto; padding: 20px; background: linear-gradient(135deg, #ffd700 0%, #ffb700 100%); border-radius: 12px; max-width: 400px; box-shadow: 0 8px 24px rgba(255,215,0,0.5);">
+    <div style="font-size: 28px; font-weight: 900; color: #000; margin-bottom: 8px;">🏆 WINNER! 🏆</div>
+    <div id="winnerText" style="font-size: 24px; font-weight: 700; color: #000;"></div>
+  </div>
+  
   <div id="raceStatus">Idle</div>
   <div id="countdown">--</div>
   <div id="lastCar" style="margin-top:8px;font-size:18px;">Last car: --</div>
   <div style="margin-top:10px;">
-  <table id="lapTable">
-    <thead>
-      <tr><th>Car</th><th>Laps</th><th>Last</th><th>Best</th></tr>
-    </thead>
-    <tbody id="lapTableBody"></tbody>
-  </table>
+  <div id="carLapDisplay"></div>
 </div>
 
   <button class="btn-start" onclick="startRace()">Start</button>
@@ -599,6 +674,14 @@ th { background: rgba(255,255,255,0.08); }
     let randomInterval = null;
     let randomTimeout = null;
     let isFinished = false;
+    let targetLaps = 5;
+
+    function setTargetLaps() {
+      const input = document.getElementById('targetLaps');
+      targetLaps = parseInt(input.value) || 5;
+      fetch('/set_target_laps?laps=' + targetLaps);
+      alert('Target set to ' + targetLaps + ' laps');
+    }
 
     // Unlock audio on any user interaction (required for autoplay)
     document.addEventListener('click', function() {
@@ -634,6 +717,20 @@ th { background: rgba(255,255,255,0.08); }
 
         document.getElementById('raceStatus').innerText = data.phaseText;
         document.getElementById('countdown').innerText = data.display;
+        
+        // Show winner if we have one
+        if (data.winnerCar && data.winnerCar > 0) {
+          document.getElementById('winnerDisplay').style.display = 'block';
+          document.getElementById('winnerText').innerText = 'Car ' + data.winnerCar + ' wins!';
+        } else {
+          document.getElementById('winnerDisplay').style.display = 'none';
+        }
+        
+        // Update target laps from server
+        if (data.targetLaps) {
+          targetLaps = data.targetLaps;
+          document.getElementById('targetLaps').value = targetLaps;
+        }
 
         // Barcode/slit lap timing
         const carText = (data.lastCar && data.lastCar > 0) ? ("Car " + data.lastCar) : "--";
@@ -641,22 +738,47 @@ th { background: rgba(255,255,255,0.08); }
         const lastEl = document.getElementById('lastCar');
         if (lastEl) lastEl.innerText = "Last car: " + carText + slitText;
 
-        // Lap table
-const body = document.getElementById('lapTableBody');
-if (body && data.lapCount) {
-  const lastCarNum = data.lastCar || 0;
-  let html = "";
-  for (let i = 0; i < data.lapCount.length; i++) {
-    const c = i + 1;
-    const laps = data.lapCount[i] || 0;
-    const last = (data.lastLapMs && data.lastLapMs[i]) ? (data.lastLapMs[i] / 1000).toFixed(2) + "s" : "--";
-    const best = (data.bestLapMs && data.bestLapMs[i]) ? (data.bestLapMs[i] / 1000).toFixed(2) + "s" : "--";
-    const cls = (c === lastCarNum) ? "car-highlight" : "";
-    html += `<tr class="${cls}"><td>${c}</td><td>${laps}</td><td>${last}</td><td>${best}</td></tr>`;
-  }
-  body.innerHTML = html;
-}
-// Play audio when phase changes to GO!
+        // Display all laps for each car
+        const carDisplay = document.getElementById('carLapDisplay');
+        if (carDisplay && data.lapTimes) {
+          const lastCarNum = data.lastCar || 0;
+          let html = "";
+          for (let i = 0; i < data.lapTimes.length; i++) {
+            const carNum = i + 1;
+            const laps = data.lapTimes[i] || [];
+            const lapCount = data.lapCount[i] || 0;
+            
+            if (lapCount > 0) {
+              const cls = (carNum === lastCarNum) ? "car-highlight" : "";
+              const best = laps.length > 0 ? Math.min(...laps.filter(l => l > 0)) : 0;
+              const isWinner = (data.winnerCar === carNum);
+              const borderColor = isWinner ? 'rgba(255,215,0,0.8)' : 'rgba(255,255,255,0.2)';
+              const bgColor = isWinner ? 'rgba(255,215,0,0.15)' : 'rgba(0,0,0,0.3)';
+              
+              html += `<div style="margin-bottom: 16px; padding: 12px; border: 2px solid ${borderColor}; border-radius: 6px; background: ${bgColor};" class="${cls}">`;
+              html += `<div style="font-size: 18px; font-weight: 700; margin-bottom: 8px; color: #29b6f6;">Car ${carNum} — ${lapCount}/${targetLaps} laps${isWinner ? ' 🏆' : ''}</div>`;
+              
+              if (best > 0) {
+                html += `<div style="font-size: 14px; margin-bottom: 8px; color: #ffc107;">Best: ${(best / 1000).toFixed(3)}s</div>`;
+              }
+              
+              html += `<div style="font-family: 'SF Mono','Roboto Mono',monospace; font-size: 13px; line-height: 1.6;">`;
+              for (let j = 0; j < laps.length && j < lapCount; j++) {
+                const lapTime = laps[j];
+                const isBest = lapTime === best;
+                const color = isBest ? '#ffc107' : '#ffffff';
+                html += `<div style="color: ${color};">${j + 1}. ${(lapTime / 1000).toFixed(3)}s${isBest ? ' 🏆' : ''}</div>`;
+              }
+              html += `</div></div>`;
+            }
+          }
+          if (html === "") {
+            html = `<div style="padding: 20px; color: rgba(255,255,255,0.5);">No laps recorded yet</div>`;
+          }
+          carDisplay.innerHTML = html;
+        }
+
+        // Play audio when phase changes to GO!
         if (data.phaseText === 'GO!' && lastPhase !== 'GO!') {
           isFinished = false;
           // Clear any existing intervals/timeouts
@@ -828,6 +950,18 @@ void handleRaceFinish() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleSetTargetLaps() {
+  if (server.hasArg("laps")) {
+    int laps = server.arg("laps").toInt();
+    if (laps >= 1 && laps <= 50) {
+      raceTargetLaps = laps;
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Invalid laps");
+}
+
 // Serve MP3 file from LittleFS
 void handleMP3() {
   File file = LittleFS.open(server.uri(), "r");
@@ -883,20 +1017,23 @@ void handleRaceStatus() {
   json += "\"lastCar\":" + String(lastDetectedCar) + ",";
   json += "\"lastSlits\":" + String(lastDetectedSlits) + ",";
   json += "\"lastAtMs\":" + String(lastDetectedAtMs) + ",";
+  json += "\"targetLaps\":" + String(raceTargetLaps) + ",";
+  json += "\"winnerCar\":" + String(raceWinnerCar) + ",";
 
   json += "\"lapCount\":[";
   for (int i = 0; i < MAX_RACE_CARS; i++) {
     json += String(raceLapCount[i]);
     if (i < MAX_RACE_CARS - 1) json += ",";
   }
-  json += "],\"lastLapMs\":[";
+  json += "],\"lapTimes\":[";
   for (int i = 0; i < MAX_RACE_CARS; i++) {
-    json += String(raceLastLapMs[i]);
-    if (i < MAX_RACE_CARS - 1) json += ",";
-  }
-  json += "],\"bestLapMs\":[";
-  for (int i = 0; i < MAX_RACE_CARS; i++) {
-    json += String(raceBestLapMs[i]);
+    json += "[";
+    int lapsToPrint = (raceLapCount[i] < MAX_RACE_LAPS_PER_CAR) ? raceLapCount[i] : MAX_RACE_LAPS_PER_CAR;
+    for (int j = 0; j < lapsToPrint; j++) {
+      json += String(raceLapTimes[i][j]);
+      if (j < lapsToPrint - 1) json += ",";
+    }
+    json += "]";
     if (i < MAX_RACE_CARS - 1) json += ",";
   }
   json += "]";
@@ -952,6 +1089,7 @@ void setup() {
   server.on("/race_start", handleRaceStart);
   server.on("/race_status", handleRaceStatus);
   server.on("/race_finish", handleRaceFinish);
+  server.on("/set_target_laps", handleSetTargetLaps);
   
   // Register routes for all MP3 files
   for (int i = 1; i <= 8; i++) {
@@ -981,93 +1119,92 @@ void loop() {
   bool currentBroken = readBeamBroken();
 
   // === Barcode/slit decode (single beam) ===
-  // Slit definition: a "slit" is a CLEAR (unbroken) segment that occurs between solid (broken) segments while the strip passes.
+  // FAST SAMPLING approach: When beam breaks, enter tight sampling loop to catch all transitions
+  // This ensures we don't miss narrow slits on angled passes
   // CarId mapping: Car1 = 0 slits, Car2 = 1 slit, ... Car6 = 5 slits.
   static bool bcActive = false;
-  static bool bcPrevBroken = false;
+  static bool bcPrevState = false;
   static uint32_t bcLastEdgeUs = 0;
-  static uint32_t bcLastChangeUs = 0;
-  static int bcSlits = 0;
-  static bool bcSawAnyBroken = false;
-  static bool bcInClear = false;
-  static uint32_t bcClearStartUs = 0;
+  static int bcTransitions = 0;
 
   uint32_t nowUs = micros();
 
-  // Edge detection with debounce
-  if (currentBroken != bcPrevBroken) {
-    if (nowUs - bcLastChangeUs > BARCODE_EDGE_DEBOUNCE_US) {
-      bcLastChangeUs = nowUs;
-
-      // Start a new frame when we first see BROKEN (solid) after being clear
-      if (!bcActive && currentBroken) {
-        bcActive = true;
-        bcSlits = 0;
-        bcSawAnyBroken = true;
-        bcInClear = false;
-        bcClearStartUs = 0;
-        bcLastEdgeUs = nowUs;
-      } else if (bcActive) {
-        // Track clear "slit" segments. Count a slit only when we see a CLEAR segment that later returns to BROKEN.
-        if (bcPrevBroken && !currentBroken) {
-          // entered CLEAR
-          bcInClear = true;
-          bcClearStartUs = nowUs;
-        } else if (!bcPrevBroken && currentBroken) {
-          // returned to BROKEN
-          if (bcInClear && (nowUs - bcClearStartUs) >= MIN_SLIT_CLEAR_US) {
-            bcSlits++;
-          }
-          bcInClear = false;
+  // Start fast sampling when beam first breaks (barcode detected)
+  if (!bcActive && currentBroken) {
+    bcActive = true;
+    bcTransitions = 0;
+    bcPrevState = currentBroken;
+    bcLastEdgeUs = nowUs;
+    
+    // FAST SAMPLING LOOP - sample at maximum speed while barcode passes
+    while (true) {
+      nowUs = micros();
+      bool currentState = readBeamBroken();
+      
+      // Detect state change with debounce
+      if (currentState != bcPrevState) {
+        uint32_t timeSinceLastEdge = nowUs - bcLastEdgeUs;
+        if (timeSinceLastEdge > BARCODE_EDGE_DEBOUNCE_US) {
+          bcTransitions++;
+          bcPrevState = currentState;
+          bcLastEdgeUs = nowUs;
         }
-        bcLastEdgeUs = nowUs;
       }
-    }
-  }
-
-  // End frame when we've been CLEAR long enough after seeing at least one BROKEN
-  if (bcActive && !currentBroken && bcSawAnyBroken) {
-    if (nowUs - bcLastEdgeUs > BARCODE_END_GAP_US) {
-      int carId = bcSlits + 1; // 0 slits => car 1
-      if (carId >= 1 && carId <= MAX_RACE_CARS) {
-        lastDetectedCar = carId;
-        lastDetectedSlits = bcSlits;
-        lastDetectedAtMs = now;
-
-        // Update per-car lap timing only when race is in GO state
-        if (racePhase == RACE_GO_DONE) {
-          int ci = carId - 1;
-          if (raceLastCrossMs[ci] != 0) {
-            unsigned long lap = now - raceLastCrossMs[ci];
-            if (lap >= MIN_RACE_LAP_MS) {
-              raceLastLapMs[ci] = lap;
-              if (raceBestLapMs[ci] == 0 || lap < raceBestLapMs[ci]) raceBestLapMs[ci] = lap;
-              raceLapCount[ci]++;
+      
+      // Exit fast sampling when beam clear for end-gap duration
+      if (!currentState && (nowUs - bcLastEdgeUs > BARCODE_END_GAP_US)) {
+        // Frame complete - decode it
+        int bcSlits = bcTransitions / 2;
+        int carId = bcSlits + 1;
+        
+        if (carId >= 1 && carId <= MAX_RACE_CARS) {
+          lastDetectedCar = carId;
+          lastDetectedSlits = bcSlits;
+          lastDetectedAtMs = millis();
+          
+          // Update lap timing if in race GO mode
+          if (racePhase == RACE_GO_DONE) {
+            int ci = carId - 1;
+            unsigned long now = millis();
+            if (raceLastCrossMs[ci] != 0) {
+              unsigned long lap = now - raceLastCrossMs[ci];
+              if (lap >= MIN_RACE_LAP_MS) {
+                if (raceLapCount[ci] < MAX_RACE_LAPS_PER_CAR) {
+                  raceLapTimes[ci][raceLapCount[ci]] = lap;
+                }
+                raceLapCount[ci]++;
+                
+                // Check if this car just won (first to reach target laps)
+                if (raceWinnerCar == 0 && raceLapCount[ci] >= raceTargetLaps) {
+                  raceWinnerCar = carId;
+                  raceWinTimeMs = now;
+                }
+              }
             }
-          } else {
-            // First time we see this car during GO, start its lap clock
-            raceLapCount[ci] = 0;
-            raceLastLapMs[ci] = 0;
-            raceBestLapMs[ci] = (raceBestLapMs[ci] == 0) ? 0 : raceBestLapMs[ci];
+            raceLastCrossMs[ci] = now;
           }
-          raceLastCrossMs[ci] = now;
+        } else {
+          lastDetectedCar = 0;
+          lastDetectedSlits = bcSlits;
+          lastDetectedAtMs = millis();
         }
-      } else {
-        lastDetectedCar = 0;
-        lastDetectedSlits = bcSlits;
-        lastDetectedAtMs = now;
+        
+        bcActive = false;
+        break;
       }
-
-      // Reset frame
-      bcActive = false;
-      bcSawAnyBroken = false;
-      bcInClear = false;
-      bcClearStartUs = 0;
-      bcSlits = 0;
+      
+      // Safety timeout: exit if frame takes too long (500ms max)
+      if (nowUs - bcLastEdgeUs > 500000) {
+        bcActive = false;
+        break;
+      }
+      
+      // Small delay to prevent overwhelming the sensor
+      delayMicroseconds(50);
     }
   }
 
-  bcPrevBroken = currentBroken;
+
 
 
   if (racePhase == RACE_IDLE) {
