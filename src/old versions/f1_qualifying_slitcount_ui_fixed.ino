@@ -20,7 +20,6 @@ const int LED5 = 33;
 const int NUM_LEDS = 5;
 int leds[NUM_LEDS] = { LED1, LED2, LED3, LED4, LED5 };
 
-
 // Buzzer pin
 const int BUZZER_PIN = 4;  // D4
 
@@ -109,20 +108,6 @@ void addLapTime(unsigned long ms) {
   }
   lapTimes[0] = ms;
   if (lapCount < MAX_LAPS) lapCount++;
-}
-
-
-// Reset per-car race stats (called on race start/finish)
-void resetRaceStats() {
-  for (int i = 0; i < MAX_RACE_CARS; i++) {
-    raceLapCount[i] = 0;
-    raceLastCrossMs[i] = 0;
-    raceLastLapMs[i] = 0;
-    raceBestLapMs[i] = 0;
-  }
-  lastDetectedCar = 0;
-  lastDetectedSlits = -1;
-  lastDetectedAtMs = 0;
 }
 
 // LED helpers
@@ -296,12 +281,7 @@ void handleRoot() {
       th, td       { font-size: 1rem; }
     }
 
-  
-#qualCarTable { width: 100%; border-collapse: collapse; margin-top: 6px; }
-#qualCarTable th, #qualCarTable td { border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; }
-#qualCarTable th { background: rgba(255,255,255,0.08); }
-.seen { background: rgba(41,182,246,0.18); }
-</style>
+  </style>
 </head>
 <body>
 
@@ -312,14 +292,6 @@ void handleRoot() {
   <button class="btn-mode" onclick="toggleMode()" id="modeButton">Toggle Mode</button>
 
   <div id="status">Status: ...</div>
-
-<div style="margin-top:10px;">
-  <div style="font-size:16px;opacity:0.9;margin-bottom:6px;">Car ID (slits)</div>
-  <table id="qualCarTable">
-    <thead><tr><th>Car</th><th>Slits</th><th>Last seen</th></tr></thead>
-    <tbody id="qualCarTableBody"></tbody>
-  </table>
-</div>
 
   <div id="bestLap">Best: --:--.---</div>
   <div id="currentTime">00:00.000</div>
@@ -412,21 +384,6 @@ void handleRoot() {
         lastServerUpdateAtClientMs = Date.now();
 
         document.getElementById('status').innerText = "Status: " + serverStatusText;
-
-// Car table (slit-count IDs)
-const tb = document.getElementById('qualCarTableBody');
-if (tb) {
-  const lastCar = data.lastCar || 0;
-  const lastAt = data.lastCarAtMs || 0;
-  let html = "";
-  for (let c = 1; c <= 6; c++) {
-    const slits = c - 1;
-    const seen = (c === lastCar) ? "✓" : "";
-    const cls = (c === lastCar) ? "seen" : "";
-    html += `<tr class="${cls}"><td>${c}</td><td>${slits}</td><td>${seen}</td></tr>`;
-  }
-  tb.innerHTML = html;
-}
 
         // Calculate and display best lap
         if (serverLapTimes.length > 0) {
@@ -563,12 +520,7 @@ void handleRacePage() {
       #countdown   { font-size: 6rem; }
       button       { font-size: 1.6rem; }
     }
-  
-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-th, td { border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; }
-th { background: rgba(255,255,255,0.08); }
-.car-highlight { background: rgba(41,182,246,0.18); }
-</style>
+  </style>
 </head>
 <body>
 
@@ -576,14 +528,7 @@ th { background: rgba(255,255,255,0.08); }
   <div id="raceStatus">Idle</div>
   <div id="countdown">--</div>
   <div id="lastCar" style="margin-top:8px;font-size:18px;">Last car: --</div>
-  <div style="margin-top:10px;">
-  <table id="lapTable">
-    <thead>
-      <tr><th>Car</th><th>Laps</th><th>Last</th><th>Best</th></tr>
-    </thead>
-    <tbody id="lapTableBody"></tbody>
-  </table>
-</div>
+  <div id="lapSummary" style="margin-top:8px;font-size:14px;opacity:0.9;"></div>
 
   <button class="btn-start" onclick="startRace()">Start</button>
   <button class="btn-finish" onclick="finishRace()">Finish</button>
@@ -641,22 +586,21 @@ th { background: rgba(255,255,255,0.08); }
         const lastEl = document.getElementById('lastCar');
         if (lastEl) lastEl.innerText = "Last car: " + carText + slitText;
 
-        // Lap table
-const body = document.getElementById('lapTableBody');
-if (body && data.lapCount) {
-  const lastCarNum = data.lastCar || 0;
-  let html = "";
-  for (let i = 0; i < data.lapCount.length; i++) {
-    const c = i + 1;
-    const laps = data.lapCount[i] || 0;
-    const last = (data.lastLapMs && data.lastLapMs[i]) ? (data.lastLapMs[i] / 1000).toFixed(2) + "s" : "--";
-    const best = (data.bestLapMs && data.bestLapMs[i]) ? (data.bestLapMs[i] / 1000).toFixed(2) + "s" : "--";
-    const cls = (c === lastCarNum) ? "car-highlight" : "";
-    html += `<tr class="${cls}"><td>${c}</td><td>${laps}</td><td>${last}</td><td>${best}</td></tr>`;
-  }
-  body.innerHTML = html;
-}
-// Play audio when phase changes to GO!
+        // Compact lap summary
+        const sumEl = document.getElementById('lapSummary');
+        if (sumEl && data.lapCount) {
+          let parts = [];
+          for (let i = 0; i < data.lapCount.length; i++) {
+            const c = i + 1;
+            const laps = data.lapCount[i];
+            const best = (data.bestLapMs && data.bestLapMs[i]) ? (data.bestLapMs[i] / 1000).toFixed(2) + "s" : "--";
+            parts.push("C" + c + ": " + laps + " laps, best " + best);
+          }
+          sumEl.innerText = parts.join(" | ");
+        }
+
+
+        // Play audio when phase changes to GO!
         if (data.phaseText === 'GO!' && lastPhase !== 'GO!') {
           isFinished = false;
           // Clear any existing intervals/timeouts
@@ -761,9 +705,6 @@ void handleStatus() {
   json += "\"lastLapMs\":" + String(lastLapTime) + ",";
   json += "\"running\":" + String(timerRunning ? "true" : "false") + ",";
   json += "\"mode\":\"" + modeStr + "\",";
-  json += "\"lastCar\":" + String((int)lastDetectedCar) + ",";
-  json += "\"lastSlits\":" + String((int)lastDetectedSlits) + ",";
-  json += "\"lastCarAtMs\":" + String((unsigned long)lastDetectedAtMs) + ",";
   json += "\"lapTimes\":[";
   for (int i = 0; i < lapCount; i++) {
     json += String(lapTimes[i]);
@@ -812,7 +753,6 @@ void handleMode() {
 void handleRaceStart() {
   // Reset sequence
   allLightsOff();
-  resetRaceStats();
   racePhase = RACE_COUNTDOWN;
   raceCountdownStartMs = millis();
   racePhaseStartMs = raceCountdownStartMs;
@@ -823,7 +763,6 @@ void handleRaceStart() {
 void handleRaceFinish() {
   // Reset race phase to IDLE
   allLightsOff();
-  resetRaceStats();
   racePhase = RACE_IDLE;
   server.send(200, "text/plain", "OK");
 }

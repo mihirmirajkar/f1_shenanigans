@@ -20,7 +20,6 @@ const int LED5 = 33;
 const int NUM_LEDS = 5;
 int leds[NUM_LEDS] = { LED1, LED2, LED3, LED4, LED5 };
 
-
 // Buzzer pin
 const int BUZZER_PIN = 4;  // D4
 

@@ -20,7 +20,6 @@ const int LED5 = 33;
 const int NUM_LEDS = 5;
 int leds[NUM_LEDS] = { LED1, LED2, LED3, LED4, LED5 };
 
-
 // Buzzer pin
 const int BUZZER_PIN = 4;  // D4
 
@@ -109,20 +108,6 @@ void addLapTime(unsigned long ms) {
   }
   lapTimes[0] = ms;
   if (lapCount < MAX_LAPS) lapCount++;
-}
-
-
-// Reset per-car race stats (called on race start/finish)
-void resetRaceStats() {
-  for (int i = 0; i < MAX_RACE_CARS; i++) {
-    raceLapCount[i] = 0;
-    raceLastCrossMs[i] = 0;
-    raceLastLapMs[i] = 0;
-    raceBestLapMs[i] = 0;
-  }
-  lastDetectedCar = 0;
-  lastDetectedSlits = -1;
-  lastDetectedAtMs = 0;
 }
 
 // LED helpers
@@ -812,7 +797,6 @@ void handleMode() {
 void handleRaceStart() {
   // Reset sequence
   allLightsOff();
-  resetRaceStats();
   racePhase = RACE_COUNTDOWN;
   raceCountdownStartMs = millis();
   racePhaseStartMs = raceCountdownStartMs;
@@ -823,7 +807,6 @@ void handleRaceStart() {
 void handleRaceFinish() {
   // Reset race phase to IDLE
   allLightsOff();
-  resetRaceStats();
   racePhase = RACE_IDLE;
   server.send(200, "text/plain", "OK");
 }

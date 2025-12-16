@@ -20,10 +20,47 @@ const int LED5 = 33;
 const int NUM_LEDS = 5;
 int leds[NUM_LEDS] = { LED1, LED2, LED3, LED4, LED5 };
 
-
 // Buzzer pin
 const int BUZZER_PIN = 4;  // D4
 
+
+// === BARCODE (single-beam, speed-robust) ===
+// Encoding (along direction of travel):
+// START: 3U solid (blocked), then 1U window (clear)
+// For each bit (b2,b1,b0): 1U window (clear) spacer, then solid pulse: 1U=0, 2U=1
+// STOP: 3U window (clear)
+// Uses edge timing; adapts to speed changes by updating unit time U as it goes.
+static const uint32_t BARCODE_FRAME_GAP_US = 60000;   // consider frame ended if no edge for this long
+static const uint32_t BARCODE_MAX_EDGES   = 80;
+
+struct DecodeResult {
+  bool ok;
+  int carId;            // 1..6
+  uint8_t bits;         // 3-bit id (0..7)
+  uint32_t unitUs;      // estimated base unit
+  String debug;
+};
+
+// Edge capture buffer (ISR writes, loop copies)
+volatile uint32_t bcEdgeUs[BARCODE_MAX_EDGES];
+volatile bool     bcEdgeBroken[BARCODE_MAX_EDGES];
+volatile uint16_t bcEdgeCount = 0;
+volatile uint32_t bcLastEdgeUs = 0;
+
+// Race lap timing per car (1..6)
+static const int MAX_CARS = 6;
+bool raceRunning = false;
+unsigned long raceStartMs = 0;
+unsigned long lastCrossMs[MAX_CARS] = {0};
+unsigned long lastLapAnchorMs[MAX_CARS] = {0};
+unsigned long lastLapMs[MAX_CARS] = {0};
+unsigned long bestLapMs[MAX_CARS] = {0};
+uint16_t lapCount[MAX_CARS] = {0};
+int lastDetectedCar = 0;
+unsigned long lastDetectedAtMs = 0;
+
+DecodeResult decodeBarcodeFrame(const uint32_t *edgeUs, const bool *edgeBroken, int edgeCount, uint32_t frameEndUs);
+void IRAM_ATTR onBeamEdge();
 // === QUALI TIMER STATE ===
 WebServer server(80);
 
@@ -42,23 +79,6 @@ unsigned long stopTime = 0;       // when timer was stopped
 const int MAX_LAPS = 10;
 unsigned long lapTimes[MAX_LAPS];
 int lapCount = 0;
-// === Race lap timing by barcode (slit count) ===
-const int MAX_RACE_CARS = 6;
-uint16_t raceLapCount[MAX_RACE_CARS] = {0};
-unsigned long raceLastCrossMs[MAX_RACE_CARS] = {0};
-unsigned long raceLastLapMs[MAX_RACE_CARS] = {0};
-unsigned long raceBestLapMs[MAX_RACE_CARS] = {0};
-
-volatile int lastDetectedCar = 0;        // 1..6
-volatile int lastDetectedSlits = -1;     // 0..5
-volatile unsigned long lastDetectedAtMs = 0;
-
-// Barcode/slit decoder tuning
-const uint32_t BARCODE_END_GAP_US = 30000;     // how long beam must stay clear to consider "frame ended"
-const uint32_t BARCODE_EDGE_DEBOUNCE_US = 300; // ignore faster edges (noise)
-const uint32_t MIN_SLIT_CLEAR_US = 1200;      // clear must last at least this long to count as a slit (filters noise)
-const unsigned long MIN_RACE_LAP_MS = 1500;    // ignore faster laps / double-counts
-
 
 // Modes: true = continuous, false = out-lap
 bool continuousMode = true;
@@ -103,26 +123,114 @@ String formatTime(unsigned long ms) {
   return String(buf);
 }
 
+
+// === Barcode ISR ===
+void IRAM_ATTR onBeamEdge() {
+  uint32_t t = micros();
+  bool broken = (digitalRead(IR_PIN) == (IR_BROKEN_IS_LOW ? LOW : HIGH));
+
+  uint16_t i = bcEdgeCount;
+  if (i < BARCODE_MAX_EDGES) {
+    bcEdgeUs[i] = t;
+    bcEdgeBroken[i] = broken;
+    bcEdgeCount = i + 1;
+    bcLastEdgeUs = t;
+  } else {
+    // overflow: reset
+    bcEdgeCount = 0;
+  }
+}
+
+// Helper for fuzzy comparisons
+static inline bool approx(uint32_t x, uint32_t target, float tol) {
+  uint32_t lo = (uint32_t)(target * (1.0f - tol));
+  uint32_t hi = (uint32_t)(target * (1.0f + tol));
+  return (x >= lo && x <= hi);
+}
+
+// === Barcode decoder (speed-robust) ===
+DecodeResult decodeBarcodeFrame(const uint32_t *edgeUs, const bool *edgeBroken, int edgeCount, uint32_t frameEndUs) {
+  DecodeResult out;
+  out.ok = false; out.carId = 0; out.bits = 0; out.unitUs = 0; out.debug = "";
+
+  if (edgeCount < 4) { out.debug = "too_few_edges"; return out; }
+
+  // Build segments: state after edge i lasts until next edge (or frame end).
+  struct Seg { bool broken; uint32_t dur; };
+  Seg segs[BARCODE_MAX_EDGES];
+  int segN = 0;
+  for (int i = 0; i < edgeCount && segN < (int)BARCODE_MAX_EDGES; i++) {
+    uint32_t t0 = edgeUs[i];
+    uint32_t t1 = (i + 1 < edgeCount) ? edgeUs[i + 1] : frameEndUs;
+    if (t1 <= t0) continue;
+    segs[segN++] = { edgeBroken[i], (uint32_t)(t1 - t0) };
+  }
+  if (segN < 4) { out.debug = "too_few_segs"; return out; }
+
+  // Expect START blocked then clear.
+  int k = 0;
+  while (k < segN && !segs[k].broken) k++; // skip leading clears
+  if (k >= segN) { out.debug = "no_block_start"; return out; }
+  if (!segs[k].broken) { out.debug = "start_not_block"; return out; }
+  if (k + 1 >= segN || segs[k + 1].broken) { out.debug = "missing_start_clear"; return out; }
+
+  uint32_t startBlock = segs[k].dur;
+  uint32_t startClear = segs[k + 1].dur;
+
+  // Estimate unit: startBlock should be ~3U, startClear ~1U
+  uint32_t u1 = startBlock / 3;
+  uint32_t u2 = startClear;
+  uint32_t U = (u1 + u2) / 2;
+  if (U < 300) { out.debug = "unit_too_small"; return out; }
+  out.unitUs = U;
+
+  // Advance past start segments
+  k += 2;
+
+  // Decode 3 bits
+  uint8_t bits = 0;
+  for (int bi = 0; bi < 3; bi++) {
+    // Need spacer clear ~1U
+    if (k >= segN || segs[k].broken) { out.debug = "bit_spacer_missing"; return out; }
+    uint32_t spacer = segs[k].dur;
+    // Allow big tolerance; update U toward spacer (helps if slowing)
+    U = (uint32_t)(0.7f * U + 0.3f * spacer);
+    k++;
+
+    if (k >= segN || !segs[k].broken) { out.debug = "bit_pulse_missing"; return out; }
+    uint32_t pulse = segs[k].dur;
+
+    // Decide 0 vs 1: pulse ~1U or ~2U (adaptive threshold)
+    float thr = 1.5f * (float)U;
+    uint8_t bit = (pulse > (uint32_t)thr) ? 1 : 0;
+    bits = (bits << 1) | bit;
+
+    // Update U: if bit==0 treat pulse as ~1U, else pulse as ~2U
+    uint32_t pulseUnit = bit ? (pulse / 2) : pulse;
+    U = (uint32_t)(0.7f * U + 0.3f * pulseUnit);
+
+    k++;
+  }
+
+  // Expect STOP clear >= ~2U (we allow missing if frame ends)
+  if (k < segN && segs[k].broken) { out.debug = "stop_not_clear"; return out; }
+
+  out.bits = bits;
+  int carId = (int)bits + 1; // map 0->1
+  if (carId < 1 || carId > 6) { out.debug = "id_out_of_range"; return out; }
+
+  out.ok = true;
+  out.carId = carId;
+  out.unitUs = U;
+  out.debug = "ok";
+  return out;
+}
 void addLapTime(unsigned long ms) {
   for (int i = MAX_LAPS - 1; i > 0; i--) {
     lapTimes[i] = lapTimes[i - 1];
   }
   lapTimes[0] = ms;
   if (lapCount < MAX_LAPS) lapCount++;
-}
-
-
-// Reset per-car race stats (called on race start/finish)
-void resetRaceStats() {
-  for (int i = 0; i < MAX_RACE_CARS; i++) {
-    raceLapCount[i] = 0;
-    raceLastCrossMs[i] = 0;
-    raceLastLapMs[i] = 0;
-    raceBestLapMs[i] = 0;
-  }
-  lastDetectedCar = 0;
-  lastDetectedSlits = -1;
-  lastDetectedAtMs = 0;
 }
 
 // LED helpers
@@ -146,6 +254,7 @@ void handleRoot() {
   // This ensures qualifying works after switching from race mode
   if (racePhase != RACE_IDLE) {
     racePhase = RACE_IDLE;
+  raceRunning = false;
     allLightsOff();
   }
   
@@ -296,12 +405,7 @@ void handleRoot() {
       th, td       { font-size: 1rem; }
     }
 
-  
-#qualCarTable { width: 100%; border-collapse: collapse; margin-top: 6px; }
-#qualCarTable th, #qualCarTable td { border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; }
-#qualCarTable th { background: rgba(255,255,255,0.08); }
-.seen { background: rgba(41,182,246,0.18); }
-</style>
+  </style>
 </head>
 <body>
 
@@ -312,14 +416,6 @@ void handleRoot() {
   <button class="btn-mode" onclick="toggleMode()" id="modeButton">Toggle Mode</button>
 
   <div id="status">Status: ...</div>
-
-<div style="margin-top:10px;">
-  <div style="font-size:16px;opacity:0.9;margin-bottom:6px;">Car ID (slits)</div>
-  <table id="qualCarTable">
-    <thead><tr><th>Car</th><th>Slits</th><th>Last seen</th></tr></thead>
-    <tbody id="qualCarTableBody"></tbody>
-  </table>
-</div>
 
   <div id="bestLap">Best: --:--.---</div>
   <div id="currentTime">00:00.000</div>
@@ -412,21 +508,6 @@ void handleRoot() {
         lastServerUpdateAtClientMs = Date.now();
 
         document.getElementById('status').innerText = "Status: " + serverStatusText;
-
-// Car table (slit-count IDs)
-const tb = document.getElementById('qualCarTableBody');
-if (tb) {
-  const lastCar = data.lastCar || 0;
-  const lastAt = data.lastCarAtMs || 0;
-  let html = "";
-  for (let c = 1; c <= 6; c++) {
-    const slits = c - 1;
-    const seen = (c === lastCar) ? "✓" : "";
-    const cls = (c === lastCar) ? "seen" : "";
-    html += `<tr class="${cls}"><td>${c}</td><td>${slits}</td><td>${seen}</td></tr>`;
-  }
-  tb.innerHTML = html;
-}
 
         // Calculate and display best lap
         if (serverLapTimes.length > 0) {
@@ -563,27 +644,27 @@ void handleRacePage() {
       #countdown   { font-size: 6rem; }
       button       { font-size: 1.6rem; }
     }
-  
-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
-th, td { border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; }
-th { background: rgba(255,255,255,0.08); }
-.car-highlight { background: rgba(41,182,246,0.18); }
-</style>
+    .card.laps { margin-top: 18px; padding: 14px; border-radius: 14px; background: rgba(255,255,255,0.08); backdrop-filter: blur(6px); max-width: 520px; width: 100%; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { padding: 8px 6px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.15); }
+    th { opacity: 0.85; font-weight: 700; }
+    .small { margin-top: 10px; opacity: 0.8; font-size: 0.95rem; }
+  </style>
 </head>
 <body>
 
   <h1>F1 Race Start</h1>
   <div id="raceStatus">Idle</div>
   <div id="countdown">--</div>
-  <div id="lastCar" style="margin-top:8px;font-size:18px;">Last car: --</div>
-  <div style="margin-top:10px;">
-  <table id="lapTable">
-    <thead>
-      <tr><th>Car</th><th>Laps</th><th>Last</th><th>Best</th></tr>
-    </thead>
-    <tbody id="lapTableBody"></tbody>
-  </table>
-</div>
+
+  <div class="card laps">
+    <h2>Lap Times</h2>
+    <table id="lapTable">
+      <thead><tr><th>Car</th><th>Laps</th><th>Last</th><th>Best</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="small" id="lastSeen">Last seen: --</div>
+  </div>
 
   <button class="btn-start" onclick="startRace()">Start</button>
   <button class="btn-finish" onclick="finishRace()">Finish</button>
@@ -627,6 +708,34 @@ th { background: rgba(255,255,255,0.08); }
       setTimeout(fetchRaceStatus, 150);
     }
 
+    function fmt(ms) {
+      if (!ms || ms <= 0) return "--";
+      const total = Math.floor(ms / 1000);
+      const m = Math.floor(total / 60);
+      const s = total % 60;
+      const mm = ms % 1000;
+      return String(m).padStart(2,'0') + ":" + String(s).padStart(2,'0') + "." + String(mm).padStart(3,'0');
+    }
+
+    function updateLapTable(data) {
+      const tbody = document.querySelector('#lapTable tbody');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      for (let i=0;i<data.lapCount.length;i++){
+        const tr = document.createElement('tr');
+        const carNum = i+1;
+        const laps = data.lapCount[i] || 0;
+        const last = fmt(data.lastLapMs[i] || 0);
+        const best = fmt(data.bestLapMs[i] || 0);
+        tr.innerHTML = `<td>${carNum}</td><td>${laps}</td><td>${last}</td><td>${best}</td>`;
+        tbody.appendChild(tr);
+      }
+      const lastSeen = document.getElementById('lastSeen');
+      if (lastSeen) {
+        lastSeen.innerText = (data.lastCar && data.lastCar>0) ? `Last seen: Car ${data.lastCar}` : 'Last seen: --';
+      }
+    }
+
     async function fetchRaceStatus() {
       try {
         const res = await fetch('/race_status');
@@ -635,28 +744,12 @@ th { background: rgba(255,255,255,0.08); }
         document.getElementById('raceStatus').innerText = data.phaseText;
         document.getElementById('countdown').innerText = data.display;
 
-        // Barcode/slit lap timing
-        const carText = (data.lastCar && data.lastCar > 0) ? ("Car " + data.lastCar) : "--";
-        const slitText = (data.lastSlits !== undefined && data.lastSlits >= 0) ? (" (" + data.lastSlits + " slits)") : "";
-        const lastEl = document.getElementById('lastCar');
-        if (lastEl) lastEl.innerText = "Last car: " + carText + slitText;
+        // Update lap table if present
+        if (data.lapCount && data.lastLapMs && data.bestLapMs) {
+          updateLapTable(data);
+        }
 
-        // Lap table
-const body = document.getElementById('lapTableBody');
-if (body && data.lapCount) {
-  const lastCarNum = data.lastCar || 0;
-  let html = "";
-  for (let i = 0; i < data.lapCount.length; i++) {
-    const c = i + 1;
-    const laps = data.lapCount[i] || 0;
-    const last = (data.lastLapMs && data.lastLapMs[i]) ? (data.lastLapMs[i] / 1000).toFixed(2) + "s" : "--";
-    const best = (data.bestLapMs && data.bestLapMs[i]) ? (data.bestLapMs[i] / 1000).toFixed(2) + "s" : "--";
-    const cls = (c === lastCarNum) ? "car-highlight" : "";
-    html += `<tr class="${cls}"><td>${c}</td><td>${laps}</td><td>${last}</td><td>${best}</td></tr>`;
-  }
-  body.innerHTML = html;
-}
-// Play audio when phase changes to GO!
+        // Play audio when phase changes to GO!
         if (data.phaseText === 'GO!' && lastPhase !== 'GO!') {
           isFinished = false;
           // Clear any existing intervals/timeouts
@@ -761,9 +854,6 @@ void handleStatus() {
   json += "\"lastLapMs\":" + String(lastLapTime) + ",";
   json += "\"running\":" + String(timerRunning ? "true" : "false") + ",";
   json += "\"mode\":\"" + modeStr + "\",";
-  json += "\"lastCar\":" + String((int)lastDetectedCar) + ",";
-  json += "\"lastSlits\":" + String((int)lastDetectedSlits) + ",";
-  json += "\"lastCarAtMs\":" + String((unsigned long)lastDetectedAtMs) + ",";
   json += "\"lapTimes\":[";
   for (int i = 0; i < lapCount; i++) {
     json += String(lapTimes[i]);
@@ -812,19 +902,36 @@ void handleMode() {
 void handleRaceStart() {
   // Reset sequence
   allLightsOff();
-  resetRaceStats();
   racePhase = RACE_COUNTDOWN;
   raceCountdownStartMs = millis();
   racePhaseStartMs = raceCountdownStartMs;
   raceRandomWaitMs = 0;
+
+  // Reset race lap timing
+  raceRunning = false;
+  raceStartMs = 0;
+  lastDetectedCar = 0;
+  lastDetectedAtMs = 0;
+  for (int i = 0; i < MAX_CARS; i++) {
+    lastCrossMs[i] = 0;
+    lastLapAnchorMs[i] = 0;
+    lastLapMs[i] = 0;
+    bestLapMs[i] = 0;
+    lapCount[i] = 0;
+  }
+  // Clear any partially captured barcode
+  noInterrupts();
+  bcEdgeCount = 0;
+  interrupts();
+
   server.send(200, "text/plain", "OK");
 }
 
 void handleRaceFinish() {
   // Reset race phase to IDLE
   allLightsOff();
-  resetRaceStats();
   racePhase = RACE_IDLE;
+  raceRunning = false;
   server.send(200, "text/plain", "OK");
 }
 
@@ -854,15 +961,10 @@ void handleRaceStatus() {
       phaseText = "Idle";
       display = "--";
       break;
-    case RACE_COUNTDOWN: {
+    case RACE_COUNTDOWN:
       phaseText = "Countdown";
-      unsigned long elapsed = now - raceCountdownStartMs;
-      long remaining = 5000 - (long)elapsed;
-      if (remaining < 0) remaining = 0;
-      long secs = (remaining + 999) / 1000; // round up
-      display = String(secs);
+      display = String((int)((3000 - (long)(now - raceCountdownStartMs) + 999) / 1000));
       break;
-    }
     case RACE_LIGHTS_FILL:
       phaseText = "Lights On";
       display = "●●●";
@@ -878,27 +980,19 @@ void handleRaceStatus() {
   }
 
   String json = "{";
-  json += "\"phaseText\":\"" + phaseText + "\",";
-  json += "\"display\":\"" + display + "\",";
-  json += "\"lastCar\":" + String(lastDetectedCar) + ",";
-  json += "\"lastSlits\":" + String(lastDetectedSlits) + ",";
-  json += "\"lastAtMs\":" + String(lastDetectedAtMs) + ",";
+  json += ""phaseText":"" + phaseText + "",";
+  json += ""display":"" + display + "",";
+  json += ""raceRunning":" + String(raceRunning ? "true" : "false") + ",";
+  json += ""lastCar":" + String(lastDetectedCar) + ",";
+  json += ""lastCarAtMs":" + String(lastDetectedAtMs) + ",";
 
-  json += "\"lapCount\":[";
-  for (int i = 0; i < MAX_RACE_CARS; i++) {
-    json += String(raceLapCount[i]);
-    if (i < MAX_RACE_CARS - 1) json += ",";
-  }
-  json += "],\"lastLapMs\":[";
-  for (int i = 0; i < MAX_RACE_CARS; i++) {
-    json += String(raceLastLapMs[i]);
-    if (i < MAX_RACE_CARS - 1) json += ",";
-  }
-  json += "],\"bestLapMs\":[";
-  for (int i = 0; i < MAX_RACE_CARS; i++) {
-    json += String(raceBestLapMs[i]);
-    if (i < MAX_RACE_CARS - 1) json += ",";
-  }
+  // Arrays: lapCount, lastLapMs, bestLapMs
+  json += ""lapCount":[";
+  for (int i = 0; i < MAX_CARS; i++) { if (i) json += ","; json += String(lapCount[i]); }
+  json += "],"lastLapMs":[";
+  for (int i = 0; i < MAX_CARS; i++) { if (i) json += ","; json += String(lastLapMs[i]); }
+  json += "],"bestLapMs":[";
+  for (int i = 0; i < MAX_CARS; i++) { if (i) json += ","; json += String(bestLapMs[i]); }
   json += "]";
 
   json += "}";
@@ -910,6 +1004,9 @@ void handleRaceStatus() {
 void setup() {
   Serial.begin(115200);
   pinMode(IR_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(IR_PIN), onBeamEdge, CHANGE);
+  // Initialize barcode edge buffer state
+  bcEdgeCount = 0; bcLastEdgeUs = micros();
 
   // LED pins
   for (int i = 0; i < NUM_LEDS; i++) {
@@ -923,6 +1020,7 @@ void setup() {
 
   // Race mode initial
   racePhase = RACE_IDLE;
+  raceRunning = false;
   allLightsOff();
   randomSeed(analogRead(0));
 
@@ -972,103 +1070,66 @@ void setup() {
 void loop() {
   server.handleClient();
 
-  unsigned long now = millis();
+  unsigned lon
+  // === Barcode lap timing during race ===
+  // We decode frames only when raceRunning is true (after GO).
+  if (raceRunning) {
+    uint32_t nowUs = micros();
+    uint16_t count = bcEdgeCount;
+    uint32_t lastEdge = bcLastEdgeUs;
+    bool beamNowBroken = readBeamBroken();
+
+    if (count >= 2 && !beamNowBroken && (uint32_t)(nowUs - lastEdge) > BARCODE_FRAME_GAP_US) {
+      // Copy volatile buffers locally (disable interrupts briefly)
+      uint32_t edgeUs[BARCODE_MAX_EDGES];
+      bool edgeBroken[BARCODE_MAX_EDGES];
+      uint16_t n;
+      noInterrupts();
+      n = bcEdgeCount;
+      if (n > BARCODE_MAX_EDGES) n = BARCODE_MAX_EDGES;
+      for (uint16_t i = 0; i < n; i++) { edgeUs[i] = bcEdgeUs[i]; edgeBroken[i] = bcEdgeBroken[i]; }
+      bcEdgeCount = 0;
+      interrupts();
+
+      DecodeResult r = decodeBarcodeFrame(edgeUs, edgeBroken, (int)n, nowUs);
+      if (r.ok && r.carId >= 1 && r.carId <= MAX_CARS) {
+        int ci = r.carId - 1;
+        unsigned long nowMs = millis();
+
+        lastDetectedCar = r.carId;
+        lastDetectedAtMs = nowMs;
+
+        // Debounce per-car
+        const unsigned long MIN_CAR_GAP_MS = 250;
+        if (nowMs - lastCrossMs[ci] >= MIN_CAR_GAP_MS) {
+          lastCrossMs[ci] = nowMs;
+
+          if (lastLapAnchorMs[ci] == 0) {
+            // First time we've seen this car since race start
+            lastLapAnchorMs[ci] = nowMs;
+          } else {
+            unsigned long lap = nowMs - lastLapAnchorMs[ci];
+            lastLapAnchorMs[ci] = nowMs;
+
+            lapCount[ci] += 1;
+            lastLapMs[ci] = lap;
+            if (bestLapMs[ci] == 0 || lap < bestLapMs[ci]) bestLapMs[ci] = lap;
+
+            Serial.print("Car "); Serial.print(r.carId);
+            Serial.print(" lap "); Serial.print(lapCount[ci]);
+            Serial.print(" time "); Serial.println(lap);
+          }
+        }
+      }
+    }
+  }
+g now = millis();
 
   // === Quali IR logic ===
   // Always read beam state to keep prevBeamBroken updated
   // But only process triggers when race mode is idle (not active)
   // This prevents qualifying timer from tracking times during race mode
   bool currentBroken = readBeamBroken();
-
-  // === Barcode/slit decode (single beam) ===
-  // Slit definition: a "slit" is a CLEAR (unbroken) segment that occurs between solid (broken) segments while the strip passes.
-  // CarId mapping: Car1 = 0 slits, Car2 = 1 slit, ... Car6 = 5 slits.
-  static bool bcActive = false;
-  static bool bcPrevBroken = false;
-  static uint32_t bcLastEdgeUs = 0;
-  static uint32_t bcLastChangeUs = 0;
-  static int bcSlits = 0;
-  static bool bcSawAnyBroken = false;
-  static bool bcInClear = false;
-  static uint32_t bcClearStartUs = 0;
-
-  uint32_t nowUs = micros();
-
-  // Edge detection with debounce
-  if (currentBroken != bcPrevBroken) {
-    if (nowUs - bcLastChangeUs > BARCODE_EDGE_DEBOUNCE_US) {
-      bcLastChangeUs = nowUs;
-
-      // Start a new frame when we first see BROKEN (solid) after being clear
-      if (!bcActive && currentBroken) {
-        bcActive = true;
-        bcSlits = 0;
-        bcSawAnyBroken = true;
-        bcInClear = false;
-        bcClearStartUs = 0;
-        bcLastEdgeUs = nowUs;
-      } else if (bcActive) {
-        // Track clear "slit" segments. Count a slit only when we see a CLEAR segment that later returns to BROKEN.
-        if (bcPrevBroken && !currentBroken) {
-          // entered CLEAR
-          bcInClear = true;
-          bcClearStartUs = nowUs;
-        } else if (!bcPrevBroken && currentBroken) {
-          // returned to BROKEN
-          if (bcInClear && (nowUs - bcClearStartUs) >= MIN_SLIT_CLEAR_US) {
-            bcSlits++;
-          }
-          bcInClear = false;
-        }
-        bcLastEdgeUs = nowUs;
-      }
-    }
-  }
-
-  // End frame when we've been CLEAR long enough after seeing at least one BROKEN
-  if (bcActive && !currentBroken && bcSawAnyBroken) {
-    if (nowUs - bcLastEdgeUs > BARCODE_END_GAP_US) {
-      int carId = bcSlits + 1; // 0 slits => car 1
-      if (carId >= 1 && carId <= MAX_RACE_CARS) {
-        lastDetectedCar = carId;
-        lastDetectedSlits = bcSlits;
-        lastDetectedAtMs = now;
-
-        // Update per-car lap timing only when race is in GO state
-        if (racePhase == RACE_GO_DONE) {
-          int ci = carId - 1;
-          if (raceLastCrossMs[ci] != 0) {
-            unsigned long lap = now - raceLastCrossMs[ci];
-            if (lap >= MIN_RACE_LAP_MS) {
-              raceLastLapMs[ci] = lap;
-              if (raceBestLapMs[ci] == 0 || lap < raceBestLapMs[ci]) raceBestLapMs[ci] = lap;
-              raceLapCount[ci]++;
-            }
-          } else {
-            // First time we see this car during GO, start its lap clock
-            raceLapCount[ci] = 0;
-            raceLastLapMs[ci] = 0;
-            raceBestLapMs[ci] = (raceBestLapMs[ci] == 0) ? 0 : raceBestLapMs[ci];
-          }
-          raceLastCrossMs[ci] = now;
-        }
-      } else {
-        lastDetectedCar = 0;
-        lastDetectedSlits = bcSlits;
-        lastDetectedAtMs = now;
-      }
-
-      // Reset frame
-      bcActive = false;
-      bcSawAnyBroken = false;
-      bcInClear = false;
-      bcClearStartUs = 0;
-      bcSlits = 0;
-    }
-  }
-
-  bcPrevBroken = currentBroken;
-
 
   if (racePhase == RACE_IDLE) {
     if (currentBroken && !prevBeamBroken) {
@@ -1151,6 +1212,8 @@ void loop() {
         // Lights out, GO!
         allLightsOff();
         racePhase = RACE_GO_DONE;
+        raceRunning = true;
+        raceStartMs = millis();
         Serial.println("LIGHTS OUT! GO!");
       }
       break;
