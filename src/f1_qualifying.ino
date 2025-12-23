@@ -57,6 +57,14 @@ const int MAX_RACE_LAPS_PER_CAR = 20;
 uint16_t raceLapCount[MAX_RACE_CARS] = {0};
 unsigned long raceLastCrossMs[MAX_RACE_CARS] = {0};
 unsigned long raceLapTimes[MAX_RACE_CARS][MAX_RACE_LAPS_PER_CAR]; // Store all lap times
+// Race mode per-car timing
+unsigned long raceTotalTimeMs[MAX_RACE_CARS] = {0}; // Total race time per car (stops when target reached)
+unsigned long raceTotalStartMs[MAX_RACE_CARS] = {0}; // When total timer started for each car
+bool raceTotalTimeStopped[MAX_RACE_CARS] = {false}; // Whether total time has stopped (target reached)
+unsigned long raceLastLapTime[MAX_RACE_CARS] = {0}; // Last lap time per car
+unsigned long raceBestLapTime[MAX_RACE_CARS] = {0}; // Best lap time per car
+unsigned long raceCurrentLapStartMs[MAX_RACE_CARS] = {0}; // Current lap start time per car
+unsigned long raceLastSensorCrossMs[MAX_RACE_CARS] = {0}; // Last sensor crossing time for delta calculation
 
 int raceTargetLaps = 5;     // Target laps to complete (default 5)
 int raceWinnerCar = 0;      // 0 = no winner yet, 1-6 = winning car
@@ -131,6 +139,13 @@ void resetRaceStats() {
   for (int i = 0; i < MAX_RACE_CARS; i++) {
     raceLapCount[i] = 0;
     raceLastCrossMs[i] = 0;
+    raceTotalTimeMs[i] = 0;
+    raceTotalStartMs[i] = 0;
+    raceTotalTimeStopped[i] = false;
+    raceLastLapTime[i] = 0;
+    raceBestLapTime[i] = 0;
+    raceCurrentLapStartMs[i] = 0;
+    raceLastSensorCrossMs[i] = 0;
     for (int j = 0; j < MAX_RACE_LAPS_PER_CAR; j++) {
       raceLapTimes[i][j] = 0;
     }
@@ -365,7 +380,7 @@ void handleRoot() {
 </head>
 <body>
 
-  <h1>F1 Qualifying Timer</h1>
+  <h1>F1 Qualifying</h1>
   <button class="btn-page" onclick="location.href='/race'">Go to Race Mode</button>
 
   <div id="mode">Mode: ...</div>
@@ -723,6 +738,11 @@ void handleRacePage() {
       color: #fff;
       border-color: #0575e6;
     }
+    .btn-stop { 
+      background: linear-gradient(135deg, #ffd700 0%, #ffb700 100%);
+      color: #000;
+      border-color: #ffd700;
+    }
     .btn-finish { 
       background: linear-gradient(135deg, #ff0050 0%, #d50032 100%);
       color: #fff;
@@ -750,11 +770,32 @@ table { width: 100%; border-collapse: collapse; margin-top: 8px; }
 th, td { border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; }
 th { background: rgba(255,255,255,0.08); }
 .car-highlight { background: rgba(41,182,246,0.18); }
+.currentLapTime {
+  font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  color: #00ff7f;
+  text-shadow: 0 0 20px rgba(0,255,127,0.6), 0 0 40px rgba(0,255,127,0.3);
+}
+.totalTime {
+  font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  color: #29b6f6;
+  text-shadow: 0 0 20px rgba(41,182,246,0.6), 0 0 40px rgba(41,182,246,0.3);
+}
+.bestLapTime {
+  font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  color: #ffc107;
+  text-shadow: 0 0 20px rgba(255,193,7,0.6), 0 0 40px rgba(255,193,7,0.3);
+}
 </style>
 </head>
 <body>
 
-  <h1>F1 Race Start</h1>
+  <h1>F1 Race</h1>
   
   <div style="margin: 12px auto; max-width: 400px;">
     <label style="font-size: 16px; color: #29b6f6; margin-right: 10px;">Target Laps:</label>
@@ -764,19 +805,34 @@ th { background: rgba(255,255,255,0.08); }
   </div>
   
   <div id="winnerDisplay" style="display:none; margin: 16px auto; padding: 20px; background: linear-gradient(135deg, #ffd700 0%, #ffb700 100%); border-radius: 12px; max-width: 400px; box-shadow: 0 8px 24px rgba(255,215,0,0.5);">
-    <div style="font-size: 28px; font-weight: 900; color: #000; margin-bottom: 8px;">🏆 WINNER! 🏆</div>
+    <div style="font-size: 28px; font-weight: 900; color: #000; margin-bottom: 8px;">🏁 CHECKERED FLAG 🏁</div>
     <div id="winnerText" style="font-size: 24px; font-weight: 700; color: #000;"></div>
   </div>
   
   <div id="raceStatus">Idle</div>
   <div id="countdown">--</div>
-  <div id="lastCar" style="margin-top:8px;font-size:18px;">Last car: --</div>
-  <div style="margin-top:10px;">
-  <div id="carLapDisplay"></div>
-</div>
+  
+  <div style="margin-top:20px;">
+    <table id="raceCarTable" style="width: 100%; border-collapse: collapse; margin-top: 6px;">
+      <thead>
+        <tr>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Car</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Laps</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Current lap</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Last lap</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Best lap</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Total time</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Delta</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Position</th>
+        </tr>
+      </thead>
+      <tbody id="raceCarTableBody"></tbody>
+    </table>
+  </div>
 
   <button class="btn-start" onclick="startRace()">Start</button>
-  <button class="btn-finish" onclick="finishRace()">Finish</button>
+  <button class="btn-stop" onclick="doRaceStop()">Stop</button>
+  <button class="btn-finish" onclick="finishRace()">Reset</button>
   <button class="btn-back" onclick="location.href='/'">Back to Quali</button>
 
   <audio id="goAudio" preload="auto">
@@ -790,6 +846,15 @@ th { background: rgba(255,255,255,0.08); }
     let randomTimeout = null;
     let isFinished = false;
     let targetLaps = 5;
+    let lastRaceStatusUpdate = 0;
+    
+    function formatTime(ms) {
+      const totalSeconds = Math.floor(ms / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      const millisPart = ms % 1000;
+      return String(minutes).padStart(2,'0') + ":" + String(seconds).padStart(2,'0') + "." + String(millisPart).padStart(3,'0');
+    }
 
     function setTargetLaps() {
       const input = document.getElementById('targetLaps');
@@ -847,50 +912,141 @@ th { background: rgba(255,255,255,0.08); }
           document.getElementById('targetLaps').value = targetLaps;
         }
 
-        // Barcode/slit lap timing
-        const carText = (data.lastCar && data.lastCar > 0) ? ("Car " + data.lastCar) : "--";
-        const slitText = (data.lastSlits !== undefined && data.lastSlits >= 0) ? (" (" + data.lastSlits + " slits)") : "";
-        const lastEl = document.getElementById('lastCar');
-        if (lastEl) lastEl.innerText = "Last car: " + carText + slitText;
-
-        // Display all laps for each car
-        const carDisplay = document.getElementById('carLapDisplay');
-        if (carDisplay && data.lapTimes) {
-          const lastCarNum = data.lastCar || 0;
-          let html = "";
-          for (let i = 0; i < data.lapTimes.length; i++) {
-            const carNum = i + 1;
-            const laps = data.lapTimes[i] || [];
-            const lapCount = data.lapCount[i] || 0;
-            
-            if (lapCount > 0) {
-              const cls = (carNum === lastCarNum) ? "car-highlight" : "";
-              const best = laps.length > 0 ? Math.min(...laps.filter(l => l > 0)) : 0;
-              const isWinner = (data.winnerCar === carNum);
-              const borderColor = isWinner ? 'rgba(255,215,0,0.8)' : 'rgba(255,255,255,0.2)';
-              const bgColor = isWinner ? 'rgba(255,215,0,0.15)' : 'rgba(0,0,0,0.3)';
-              
-              html += `<div style="margin-bottom: 16px; padding: 12px; border: 2px solid ${borderColor}; border-radius: 6px; background: ${bgColor};" class="${cls}">`;
-              html += `<div style="font-size: 18px; font-weight: 700; margin-bottom: 8px; color: #29b6f6;">Car ${carNum} — ${lapCount}/${targetLaps} laps${isWinner ? ' 🏆' : ''}</div>`;
-              
-              if (best > 0) {
-                html += `<div style="font-size: 14px; margin-bottom: 8px; color: #ffc107;">Best: ${(best / 1000).toFixed(3)}s</div>`;
-              }
-              
-              html += `<div style="font-family: 'SF Mono','Roboto Mono',monospace; font-size: 13px; line-height: 1.6;">`;
-              for (let j = 0; j < laps.length && j < lapCount; j++) {
-                const lapTime = laps[j];
-                const isBest = lapTime === best;
-                const color = isBest ? '#ffc107' : '#ffffff';
-                html += `<div style="color: ${color};">${j + 1}. ${(lapTime / 1000).toFixed(3)}s${isBest ? ' 🏆' : ''}</div>`;
-              }
-              html += `</div></div>`;
+        // Render race car table
+        const raceTableBody = document.getElementById('raceCarTableBody');
+        if (raceTableBody) {
+          const lapCounts = data.lapCount || [];
+          const totalTimes = data.totalTimes || [];
+          const lastLapTimes = data.lastLapTimes || [];
+          const bestLapTimes = data.bestLapTimes || [];
+          const currentLapStartTimes = data.currentLapStartTimes || [];
+          const lastSensorCrossTimes = data.lastSensorCrossTimes || [];
+          const totalTimeStopped = data.totalTimeStopped || [];
+          const totalStartTimes = data.totalStartTimes || [];
+          const serverNow = data.serverNowMs || 0;
+          lastServerNow = serverNow;
+          const clientNow = Date.now();
+          const timeSinceLastUpdate = clientNow - (lastRaceStatusUpdate || clientNow);
+          const estimatedServerNow = serverNow + timeSinceLastUpdate;
+          
+          // Calculate positions based on race position logic:
+          // 1. More laps = ahead
+          // 2. If same laps, earlier last sensor crossing = ahead (passed sensor first)
+          const carsWithPosition = [];
+          for (let c = 1; c <= 6; c++) {
+            const lapCount = lapCounts[c - 1] || 0;
+            const lastCrossTime = lastSensorCrossTimes[c - 1] || 0;
+            // Only include cars that have started (have at least one crossing or lap)
+            if (lapCount > 0 || lastCrossTime > 0) {
+              carsWithPosition.push({ 
+                car: c, 
+                lapCount: lapCount,
+                lastCrossTime: lastCrossTime || Infinity // Use Infinity if no crossing yet
+              });
             }
           }
-          if (html === "") {
-            html = `<div style="padding: 20px; color: rgba(255,255,255,0.5);">No laps recorded yet</div>`;
+          
+          carsWithPosition.sort((a, b) => {
+            // First sort by lap count (descending - more laps = ahead)
+            if (b.lapCount !== a.lapCount) {
+              return b.lapCount - a.lapCount;
+            }
+            // If same lap count, sort by last sensor crossing time (ascending - earlier = ahead)
+            // Earlier crossing means they passed the sensor first, so they're ahead
+            return a.lastCrossTime - b.lastCrossTime;
+          });
+          
+          const positions = {};
+          for (let i = 0; i < carsWithPosition.length; i++) {
+            positions[carsWithPosition[i].car] = i + 1;
           }
-          carDisplay.innerHTML = html;
+          
+          // Calculate deltas based on total time (only for cars that completed target laps)
+          const deltas = {};
+          for (let c = 1; c <= 6; c++) {
+            const myPos = positions[c];
+            const isStopped = totalTimeStopped[c - 1];
+            const myTotalTime = totalTimes[c - 1] || 0;
+            
+            // Only calculate delta if car has completed target laps (timer stopped)
+            if (isStopped && myTotalTime > 0 && myPos && myPos > 1) {
+              // Find the car directly in front (position = myPos - 1)
+              for (let other = 1; other <= 6; other++) {
+                if (other === c) continue;
+                const otherPos = positions[other];
+                if (otherPos === myPos - 1) {
+                  const otherTotalTime = totalTimes[other - 1] || 0;
+                  const otherStopped = totalTimeStopped[other - 1];
+                  // Only calculate if car ahead has also finished
+                  if (otherStopped && otherTotalTime > 0) {
+                    deltas[c] = myTotalTime - otherTotalTime;
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          
+          let html = "";
+          // Sort cars by position for display
+          const carsToDisplay = [];
+          for (let c = 1; c <= 6; c++) {
+            const pos = positions[c];
+            carsToDisplay.push({ car: c, position: pos || 999 });
+          }
+          carsToDisplay.sort((a, b) => a.position - b.position);
+          
+          for (let i = 0; i < carsToDisplay.length; i++) {
+            const c = carsToDisplay[i].car;
+            const lapCount = lapCounts[c - 1] || 0;
+            const currentLapStart = currentLapStartTimes[c - 1] || 0;
+            const lastLapMs = lastLapTimes[c - 1] || 0;
+            const bestLapMs = bestLapTimes[c - 1] || 0;
+            const totalTimeMs = totalTimes[c - 1] || 0;
+            const isStopped = totalTimeStopped[c - 1];
+            const deltaMs = deltas[c];
+            const pos = positions[c];
+            
+            // Current lap time (only show if car hasn't completed target laps)
+            let currentLapText = "--";
+            if (currentLapStart > 0 && data.phaseText === 'GO!' && lapCount < targetLaps) {
+              const currentLapMs = estimatedServerNow - currentLapStart;
+              currentLapText = formatTime(currentLapMs);
+            }
+            
+            // Total time (will be updated in real-time by animation loop)
+            const totalStartTime = totalStartTimes[c - 1] || 0;
+            let totalTimeText = "--";
+            if (isStopped && totalTimeMs > 0) {
+              totalTimeText = formatTime(totalTimeMs) + " 🏁";
+            } else if (data.phaseText === 'GO!' && totalStartTime > 0) {
+              // Show initial value, will be updated smoothly by animation loop
+              const initialTotalMs = estimatedServerNow - totalStartTime;
+              totalTimeText = formatTime(initialTotalMs);
+            }
+            
+            // Last lap
+            const lastLapText = (lastLapMs > 0) ? formatTime(lastLapMs) : "--";
+            
+            // Best lap
+            const bestLapText = (bestLapMs > 0) ? formatTime(bestLapMs) : "--";
+            
+            // Delta (only show if car has completed target laps)
+            let deltaText = "--";
+            if (isStopped && deltaMs !== undefined && deltaMs >= 0) {
+              const totalSeconds = Math.floor(deltaMs / 1000);
+              const seconds = totalSeconds % 60;
+              const millisPart = deltaMs % 1000;
+              deltaText = "+" + String(seconds) + "." + String(millisPart).padStart(3, '0');
+            }
+            
+            // Position
+            const posText = (pos !== undefined) ? "P" + pos : "--";
+            
+            html += `<tr><td>#${c}</td><td>${lapCount}</td><td class="currentLapTime" data-start="${currentLapStart}">${currentLapText}</td><td>${lastLapText}</td><td class="bestLapTime">${bestLapText}</td><td class="totalTime" data-total="${totalTimeMs}" data-total-start="${totalStartTime}" data-stopped="${isStopped}">${totalTimeText}</td><td>${deltaText}</td><td>${posText}</td></tr>`;
+          }
+          raceTableBody.innerHTML = html;
+          lastRaceStatusUpdate = clientNow;
         }
 
         // Play audio when phase changes to GO!
@@ -941,6 +1097,11 @@ th { background: rgba(255,255,255,0.08); }
       goAudio.play().catch(e => console.log('Random audio play failed:', e));
     }
 
+    async function doRaceStop() {
+      await fetch('/race_stop');
+      setTimeout(fetchRaceStatus, 150);
+    }
+
     async function finishRace() {
       isFinished = true;
       if (randomInterval) {
@@ -957,8 +1118,74 @@ th { background: rgba(255,255,255,0.08); }
       setTimeout(fetchRaceStatus, 150);
     }
 
+    function updateRaceTimers() {
+      const raceTableBody = document.getElementById('raceCarTableBody');
+      if (!raceTableBody) return;
+      
+      const rows = raceTableBody.querySelectorAll('tr');
+      rows.forEach(row => {
+        const carCell = row.querySelector('td');
+        if (!carCell) return;
+        const carNum = parseInt(carCell.textContent.replace('#', ''));
+        if (isNaN(carNum)) return;
+        
+        // Get lap count and check if car has finished
+        const lapCountCell = row.cells[1]; // Laps column
+        const lapCount = parseInt(lapCountCell.textContent) || 0;
+        const isFinished = lapCount >= targetLaps;
+        
+        // Update current lap timer if it exists and car hasn't finished
+        const currentLapCell = row.querySelector('.currentLapTime');
+        if (currentLapCell && !isFinished) {
+          const startTime = parseInt(currentLapCell.getAttribute('data-start')) || 0;
+          if (startTime > 0 && lastRaceStatusUpdate > 0) {
+            const clientNow = Date.now();
+            const timeSinceUpdate = clientNow - lastRaceStatusUpdate;
+            const estimatedServerNow = lastServerNow + timeSinceUpdate;
+            const currentLapMs = estimatedServerNow - startTime;
+            currentLapCell.textContent = formatTime(currentLapMs);
+          }
+        } else if (currentLapCell && isFinished) {
+          // Car has finished - show "--"
+          currentLapCell.textContent = "--";
+        }
+        
+        // Update total time smoothly (like current lap timer)
+        const totalTimeCell = row.querySelector('.totalTime');
+        if (totalTimeCell) {
+          const isStopped = totalTimeCell.getAttribute('data-stopped') === 'true';
+          const totalStartTime = parseInt(totalTimeCell.getAttribute('data-total-start')) || 0;
+          
+          if (isStopped) {
+            // Timer has stopped - use stored value and show checkered flag
+            const totalTimeMs = parseInt(totalTimeCell.getAttribute('data-total')) || 0;
+            if (totalTimeMs > 0) {
+              totalTimeCell.textContent = formatTime(totalTimeMs) + " 🏁";
+            } else {
+              totalTimeCell.textContent = "--";
+            }
+          } else if (totalStartTime > 0 && lastRaceStatusUpdate > 0) {
+            // Timer is running - calculate smoothly
+            const clientNow = Date.now();
+            const timeSinceUpdate = clientNow - lastRaceStatusUpdate;
+            const estimatedServerNow = lastServerNow + timeSinceUpdate;
+            const runningTotalMs = estimatedServerNow - totalStartTime;
+            if (runningTotalMs > 0) {
+              totalTimeCell.textContent = formatTime(runningTotalMs);
+            } else {
+              totalTimeCell.textContent = "--";
+            }
+          }
+        }
+      });
+      
+      requestAnimationFrame(updateRaceTimers);
+    }
+    
+    let lastServerNow = 0;
     setInterval(fetchRaceStatus, 150);
     fetchRaceStatus();
+    requestAnimationFrame(updateRaceTimers);
   </script>
 
 </body>
@@ -1106,6 +1333,22 @@ void handleRaceStart() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleRaceStop() {
+  // Stop all car timers (current lap and total time)
+  unsigned long now = millis();
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    // Stop current lap timer
+    raceCurrentLapStartMs[i] = 0;
+    
+    // Stop total time timer if it's running (but don't reset it)
+    if (raceTotalStartMs[i] > 0 && !raceTotalTimeStopped[i]) {
+      raceTotalTimeMs[i] = now - raceTotalStartMs[i];
+      raceTotalTimeStopped[i] = true;
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
 void handleRaceFinish() {
   // Reset race phase to IDLE
   allLightsOff();
@@ -1175,6 +1418,28 @@ void handleRaceStatus() {
       break;
   }
 
+  // Calculate total times (update if not stopped)
+  unsigned long raceTotalTimes[MAX_RACE_CARS];
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    if (raceTotalTimeStopped[i]) {
+      raceTotalTimes[i] = raceTotalTimeMs[i];
+    } else if (raceTotalStartMs[i] > 0 && racePhase == RACE_GO_DONE) {
+      raceTotalTimes[i] = now - raceTotalStartMs[i];
+    } else {
+      raceTotalTimes[i] = 0;
+    }
+  }
+  
+  // Calculate current lap times (only if car hasn't completed target laps)
+  unsigned long raceCurrentLapTimes[MAX_RACE_CARS];
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    if (raceCurrentLapStartMs[i] > 0 && racePhase == RACE_GO_DONE && raceLapCount[i] < raceTargetLaps) {
+      raceCurrentLapTimes[i] = now - raceCurrentLapStartMs[i];
+    } else {
+      raceCurrentLapTimes[i] = 0;
+    }
+  }
+
   String json = "{";
   json += "\"phaseText\":\"" + phaseText + "\",";
   json += "\"display\":\"" + display + "\",";
@@ -1183,6 +1448,7 @@ void handleRaceStatus() {
   json += "\"lastAtMs\":" + String(lastDetectedAtMs) + ",";
   json += "\"targetLaps\":" + String(raceTargetLaps) + ",";
   json += "\"winnerCar\":" + String(raceWinnerCar) + ",";
+  json += "\"serverNowMs\":" + String(now) + ",";
 
   json += "\"lapCount\":[";
   for (int i = 0; i < MAX_RACE_CARS; i++) {
@@ -1198,6 +1464,41 @@ void handleRaceStatus() {
       if (j < lapsToPrint - 1) json += ",";
     }
     json += "]";
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"totalTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(raceTotalTimes[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"totalStartTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(raceTotalStartMs[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"lastLapTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(raceLastLapTime[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"bestLapTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(raceBestLapTime[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"currentLapStartTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(raceCurrentLapStartMs[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"lastSensorCrossTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(raceLastSensorCrossMs[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"totalTimeStopped\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(raceTotalTimeStopped[i] ? "true" : "false");
     if (i < MAX_RACE_CARS - 1) json += ",";
   }
   json += "]";
@@ -1252,6 +1553,7 @@ void setup() {
   server.on("/race", handleRacePage);
   server.on("/race_start", handleRaceStart);
   server.on("/race_status", handleRaceStatus);
+  server.on("/race_stop", handleRaceStop);
   server.on("/race_finish", handleRaceFinish);
   server.on("/set_target_laps", handleSetTargetLaps);
   
@@ -1322,6 +1624,7 @@ void loop() {
         int carId = bcSlits + 1;
         
         if (carId >= 1 && carId <= MAX_RACE_CARS) {
+          // Update lastDetectedCar for race status API (used in both modes)
           lastDetectedCar = carId;
           lastDetectedSlits = bcSlits;
           lastDetectedAtMs = millis();
@@ -1330,13 +1633,33 @@ void loop() {
           if (racePhase == RACE_GO_DONE) {
             int ci = carId - 1;
             unsigned long now = millis();
+            
+            // Start total race timer for this car if not started (first crossing after GO)
+            if (raceTotalStartMs[ci] == 0) {
+              raceTotalStartMs[ci] = now;
+            }
+            
             if (raceLastCrossMs[ci] != 0) {
+              // This is not the first crossing - calculate lap time
               unsigned long lap = now - raceLastCrossMs[ci];
               if (lap >= MIN_RACE_LAP_MS) {
                 if (raceLapCount[ci] < MAX_RACE_LAPS_PER_CAR) {
                   raceLapTimes[ci][raceLapCount[ci]] = lap;
                 }
                 raceLapCount[ci]++;
+                
+                // Update last lap and best lap times
+                raceLastLapTime[ci] = lap;
+                if (raceBestLapTime[ci] == 0 || lap < raceBestLapTime[ci]) {
+                  raceBestLapTime[ci] = lap;
+                }
+                
+                // Check if this car just completed target laps - stop total timer and current lap timer
+                if (raceLapCount[ci] >= raceTargetLaps && !raceTotalTimeStopped[ci]) {
+                  raceTotalTimeMs[ci] = now - raceTotalStartMs[ci];
+                  raceTotalTimeStopped[ci] = true;
+                  raceCurrentLapStartMs[ci] = 0; // Stop current lap timer
+                }
                 
                 // Check if this car just won (first to reach target laps)
                 if (raceWinnerCar == 0 && raceLapCount[ci] >= raceTargetLaps) {
@@ -1345,7 +1668,15 @@ void loop() {
                 }
               }
             }
+            
+            // Update crossing times
             raceLastCrossMs[ci] = now;
+            raceLastSensorCrossMs[ci] = now; // For delta calculation
+            
+            // Only start/update current lap timer if car hasn't completed target laps
+            if (raceLapCount[ci] < raceTargetLaps) {
+              raceCurrentLapStartMs[ci] = now; // Start/update current lap timer
+            }
           }
         } else {
           lastDetectedCar = 0;
@@ -1371,12 +1702,18 @@ void loop() {
 
 
 
+  // Only process qualifying timing when race mode is completely idle
+  // This ensures qualifying statistics are not affected during race mode
+  // IMPORTANT: Qualifying lap times, best laps, and lap counts are ONLY updated here
+  // when racePhase == RACE_IDLE. During any race phase (COUNTDOWN, LIGHTS_FILL, 
+  // RANDOM_WAIT, or GO_DONE), qualifying statistics will NOT be updated.
   if (racePhase == RACE_IDLE) {
     if (currentBroken && !prevBeamBroken) {
       if (now - lastTriggerTime > MIN_TRIGGER_GAP_MS) {
         lastTriggerTime = now;
 
         // Handle per-car lap timing (independent for each car)
+        // Only process if we have a valid car detection AND we're in qualifying mode (RACE_IDLE)
         if (lastDetectedCar >= 1 && lastDetectedCar <= MAX_RACE_CARS) {
           int carIdx = lastDetectedCar - 1;
           
