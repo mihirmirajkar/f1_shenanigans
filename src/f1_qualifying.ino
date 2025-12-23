@@ -38,12 +38,21 @@ unsigned long lapStartTime = 0;   // when current lap started
 unsigned long lastLapTime = 0;    // last completed lap (ms)
 unsigned long stopTime = 0;       // when timer was stopped
 
-// Lap history (last 10 laps, newest at 0)
-const int MAX_LAPS = 10;
+// Lap history (last 50 laps, newest at 0)
+const int MAX_LAPS = 50;
 unsigned long lapTimes[MAX_LAPS];
+int lapCars[MAX_LAPS];  // Car ID (1-6) for each lap, 0 = unknown
 int lapCount = 0;
 // === Race lap timing by barcode (slit count) ===
 const int MAX_RACE_CARS = 6;
+// Last lap time per car in qualifying mode
+unsigned long qualLastLapTime[MAX_RACE_CARS] = {0};
+// Best lap time per car in qualifying mode (0 = no lap recorded)
+unsigned long qualBestLapTime[MAX_RACE_CARS] = {0};
+// Lap count per car in qualifying mode
+uint16_t qualLapCount[MAX_RACE_CARS] = {0};
+// Current lap start time per car in qualifying mode (0 = not currently running)
+unsigned long qualLapStartTime[MAX_RACE_CARS] = {0};
 const int MAX_RACE_LAPS_PER_CAR = 20;
 uint16_t raceLapCount[MAX_RACE_CARS] = {0};
 unsigned long raceLastCrossMs[MAX_RACE_CARS] = {0};
@@ -106,11 +115,13 @@ String formatTime(unsigned long ms) {
   return String(buf);
 }
 
-void addLapTime(unsigned long ms) {
+void addLapTime(unsigned long ms, int carId = 0) {
   for (int i = MAX_LAPS - 1; i > 0; i--) {
     lapTimes[i] = lapTimes[i - 1];
+    lapCars[i] = lapCars[i - 1];
   }
   lapTimes[0] = ms;
+  lapCars[0] = carId;
   if (lapCount < MAX_LAPS) lapCount++;
 }
 
@@ -317,11 +328,6 @@ void handleRoot() {
       border-bottom: 1px solid rgba(255,255,255,0.1);
     }
 
-    tr:nth-child(1) td {
-      color: #00ff7f;
-      font-weight: 700;
-    }
-
     .lap-index { width: 20%; text-align: left; }
     .lap-time  { width: 80%; text-align: right; }
 
@@ -341,7 +347,20 @@ void handleRoot() {
 #qualCarTable { width: 100%; border-collapse: collapse; margin-top: 6px; }
 #qualCarTable th, #qualCarTable td { border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; }
 #qualCarTable th { background: rgba(255,255,255,0.08); }
-.seen { background: rgba(41,182,246,0.18); }
+.currentLapTime {
+  font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  color: #00ff7f;
+  text-shadow: 0 0 20px rgba(0,255,127,0.6), 0 0 40px rgba(0,255,127,0.3);
+}
+.bestLapTime {
+  font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  color: #ffc107;
+  text-shadow: 0 0 20px rgba(255,193,7,0.6), 0 0 40px rgba(255,193,7,0.3);
+}
 </style>
 </head>
 <body>
@@ -355,25 +374,23 @@ void handleRoot() {
   <div id="status">Status: ...</div>
 
 <div style="margin-top:10px;">
-  <div style="font-size:16px;opacity:0.9;margin-bottom:6px;">Car ID (slits)</div>
   <table id="qualCarTable">
-    <thead><tr><th>Car</th><th>Slits</th><th>Last seen</th></tr></thead>
+    <thead><tr><th>Car</th><th>Laps</th><th>Current lap</th><th>Last lap</th><th>Best lap</th><th>Delta</th><th>Grid Position</th></tr></thead>
     <tbody id="qualCarTableBody"></tbody>
   </table>
 </div>
 
-  <div id="bestLap">Best: --:--.---</div>
-  <div id="currentTime">00:00.000</div>
-  <div id="lastLap">Last: --:--.---</div>
+  <div id="currentTime" style="display:none;">00:00.000</div>
 
   <button class="btn-reset" onclick="doReset()">Reset</button>
   <button class="btn-stop" onclick="doStop()">Stop</button>
 
   <div class="laps-container">
-    <div class="laps-title">Lap Times (Last 10)</div>
+    <div class="laps-title">Lap Times (Last 50)</div>
     <table>
       <thead>
         <tr>
+          <th>Car</th>
           <th>Lap</th>
           <th>Time</th>
         </tr>
@@ -389,7 +406,11 @@ void handleRoot() {
     let lastServerUpdateAtClientMs = 0;
     let serverStatusText = "WAITING";
     let serverLapTimes = [];
+    let serverLapCars = [];
     let serverMode = "continuous";
+    let qualLapStartTimes = [];
+    let serverNowMs = 0;
+    let serverQualLapCounts = [];
 
     function formatTime(ms) {
       const totalSeconds = Math.floor(ms / 1000);
@@ -422,17 +443,42 @@ void handleRoot() {
       const body = document.getElementById('lapsBody');
       body.innerHTML = "";
 
+      // Track how many times we've seen each car so far (newest to oldest in display)
+      const carSeenCounts = [0, 0, 0, 0, 0, 0];
+      
       for (let i = 0; i < serverLapTimes.length; i++) {
         const lapMs = serverLapTimes[i];
+        const carId = serverLapCars[i] || 0;
         const tr = document.createElement('tr');
 
-        const tdIdx = document.createElement('td');
-        tdIdx.textContent = "#" + (i + 1);
+        const tdCar = document.createElement('td');
+        tdCar.textContent = (carId > 0) ? "#" + carId : "--";
+
+        const tdLap = document.createElement('td');
+        if (carId > 0 && carId <= 6) {
+          carSeenCounts[carId - 1]++;
+          // Use the actual total lap count for this car from qualLapCounts
+          const totalLaps = (serverQualLapCounts && serverQualLapCounts[carId - 1]) 
+            ? serverQualLapCounts[carId - 1] 
+            : 0;
+          
+          if (totalLaps > 0) {
+            // Calculate lap number: newest lap = totalLaps, then count down
+            // First occurrence (newest) gets the highest lap number
+            const lapNum = totalLaps - carSeenCounts[carId - 1] + 1;
+            tdLap.textContent = lapNum;
+          } else {
+            tdLap.textContent = "--";
+          }
+        } else {
+          tdLap.textContent = "--";
+        }
 
         const tdTime = document.createElement('td');
         tdTime.textContent = formatTime(lapMs);
 
-        tr.appendChild(tdIdx);
+        tr.appendChild(tdCar);
+        tr.appendChild(tdLap);
         tr.appendChild(tdTime);
         body.appendChild(tr);
       }
@@ -448,7 +494,10 @@ void handleRoot() {
         serverLastLapMs = data.lastLapMs;
         serverStatusText = data.status;
         serverLapTimes = data.lapTimes || [];
+        serverLapCars = data.lapCars || [];
         serverMode = data.mode;
+        serverNowMs = data.serverNowMs || 0;
+        serverQualLapCounts = data.qualLapCounts || [];
 
         lastServerUpdateAtClientMs = Date.now();
 
@@ -458,30 +507,76 @@ void handleRoot() {
 const tb = document.getElementById('qualCarTableBody');
 if (tb) {
   const lastCar = data.lastCar || 0;
-  const lastAt = data.lastCarAtMs || 0;
-  let html = "";
+  const qualLastLapTimes = data.qualLastLapTimes || [];
+  const qualBestLapTimes = data.qualBestLapTimes || [];
+  const qualLapCounts = data.qualLapCounts || [];
+  qualLapStartTimes = data.qualLapStartTimes || [];
+  
+  // Calculate grid positions based on best lap times
+  const carBestLaps = [];
   for (let c = 1; c <= 6; c++) {
-    const slits = c - 1;
-    const seen = (c === lastCar) ? "✓" : "";
-    const cls = (c === lastCar) ? "seen" : "";
-    html += `<tr class="${cls}"><td>${c}</td><td>${slits}</td><td>${seen}</td></tr>`;
+    const bestLapMs = qualBestLapTimes[c - 1] || 0;
+    if (bestLapMs > 0) {
+      carBestLaps.push({ car: c, time: bestLapMs });
+    }
+  }
+  // Sort by best lap time (fastest first)
+  carBestLaps.sort((a, b) => a.time - b.time);
+  
+  // Get leader's best lap time (fastest)
+  const leaderBestLapMs = (carBestLaps.length > 0) ? carBestLaps[0].time : 0;
+  
+  // Create position map: car number -> grid position
+  const gridPositions = {};
+  for (let i = 0; i < carBestLaps.length; i++) {
+    gridPositions[carBestLaps[i].car] = i + 1;
+  }
+  
+  // Create array of all cars with their grid positions for sorting
+  const carsWithPositions = [];
+  for (let c = 1; c <= 6; c++) {
+    const gridPos = gridPositions[c];
+    carsWithPositions.push({
+      car: c,
+      gridPos: (gridPos !== undefined) ? gridPos : 999 // Cars without position go to end
+    });
+  }
+  
+  // Sort by grid position (P1 first, then P2, etc., then cars without position)
+  carsWithPositions.sort((a, b) => a.gridPos - b.gridPos);
+  
+  let html = "";
+  for (let i = 0; i < carsWithPositions.length; i++) {
+    const c = carsWithPositions[i].car;
+    const lapCount = qualLapCounts[c - 1] || 0;
+    const startTime = qualLapStartTimes[c - 1] || 0;
+    const currentLapText = (startTime > 0) ? formatTime(0) : "--";
+    const lastLapMs = qualLastLapTimes[c - 1] || 0;
+    const lastLapText = (lastLapMs > 0) ? formatTime(lastLapMs) : "--";
+    const bestLapMs = qualBestLapTimes[c - 1] || 0;
+    const bestLapText = (bestLapMs > 0) ? formatTime(bestLapMs) : "--";
+    
+    // Calculate delta from leader
+    let deltaText = "--";
+    if (bestLapMs > 0 && leaderBestLapMs > 0) {
+      const deltaMs = bestLapMs - leaderBestLapMs;
+      if (deltaMs === 0) {
+        deltaText = "--"; // Leader shows "--"
+      } else {
+        // Format delta without minutes: SS.mmm
+        const totalSeconds = Math.floor(deltaMs / 1000);
+        const seconds = totalSeconds % 60;
+        const millisPart = deltaMs % 1000;
+        deltaText = "+" + String(seconds).padStart(2, '0') + "." + String(millisPart).padStart(3, '0');
+      }
+    }
+    
+    const gridPos = gridPositions[c];
+    const gridText = (gridPos !== undefined) ? "P" + gridPos : "--";
+    html += `<tr data-car="${c}"><td>#${c}</td><td>${lapCount}</td><td class="currentLapTime" data-start="${startTime}">${currentLapText}</td><td>${lastLapText}</td><td class="bestLapTime">${bestLapText}</td><td>${deltaText}</td><td>${gridText}</td></tr>`;
   }
   tb.innerHTML = html;
 }
-
-        // Calculate and display best lap
-        if (serverLapTimes.length > 0) {
-          const bestLapMs = Math.min(...serverLapTimes);
-          document.getElementById('bestLap').innerText = "Best: " + formatTime(bestLapMs);
-        } else {
-          document.getElementById('bestLap').innerText = "Best: --:--.---";
-        }
-
-        if (serverLastLapMs > 0) {
-          document.getElementById('lastLap').innerText = "Last: " + formatTime(serverLastLapMs);
-        } else {
-          document.getElementById('lastLap').innerText = "Last: --:--.---";
-        }
 
         updateModeLabel();
         renderLaps();
@@ -499,6 +594,28 @@ if (tb) {
       }
 
       document.getElementById('currentTime').innerText = formatTime(displayMs);
+      
+      // Update all car current lap timers
+      const clientNow = Date.now();
+      const timeSinceLastUpdate = clientNow - lastServerUpdateAtClientMs;
+      const estimatedServerNow = serverNowMs + timeSinceLastUpdate;
+      
+      for (let c = 1; c <= 6; c++) {
+        const row = document.querySelector(`tr[data-car="${c}"]`);
+        if (row) {
+          const cell = row.querySelector('.currentLapTime');
+          if (cell) {
+            const startTime = qualLapStartTimes[c - 1] || 0;
+            if (startTime > 0 && estimatedServerNow > startTime) {
+              const elapsedMs = estimatedServerNow - startTime;
+              cell.innerText = formatTime(elapsedMs);
+            } else {
+              cell.innerText = "--";
+            }
+          }
+        }
+      }
+      
       requestAnimationFrame(animationLoop);
     }
 
@@ -509,8 +626,6 @@ if (tb) {
       serverLapTimes = [];
       serverRunning = false;
       document.getElementById('currentTime').innerText = formatTime(0);
-      document.getElementById('bestLap').innerText = "Best: --:--.---";
-      document.getElementById('lastLap').innerText = "Last: --:--.---";
       renderLaps();
     }
 
@@ -883,12 +998,38 @@ void handleStatus() {
   json += "\"lastLapMs\":" + String(lastLapTime) + ",";
   json += "\"running\":" + String(timerRunning ? "true" : "false") + ",";
   json += "\"mode\":\"" + modeStr + "\",";
+  json += "\"serverNowMs\":" + String(now) + ",";
   json += "\"lastCar\":" + String((int)lastDetectedCar) + ",";
   json += "\"lastSlits\":" + String((int)lastDetectedSlits) + ",";
   json += "\"lastCarAtMs\":" + String((unsigned long)lastDetectedAtMs) + ",";
-  json += "\"lapTimes\":[";
+  json += "\"qualLastLapTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(qualLastLapTime[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"qualBestLapTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(qualBestLapTime[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"qualLapCounts\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(qualLapCount[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"qualLapStartTimes\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(qualLapStartTime[i]);
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"lapTimes\":[";
   for (int i = 0; i < lapCount; i++) {
     json += String(lapTimes[i]);
+    if (i < lapCount - 1) json += ",";
+  }
+  json += "],\"lapCars\":[";
+  for (int i = 0; i < lapCount; i++) {
+    json += String(lapCars[i]);
     if (i < lapCount - 1) json += ",";
   }
   json += "]}";
@@ -903,16 +1044,29 @@ void handleReset() {
   lastLapTime = 0;
   stopTime = 0;
   lapCount = 0;
+  for (int i = 0; i < MAX_LAPS; i++) {
+    lapCars[i] = 0;
+  }
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    qualLastLapTime[i] = 0;
+    qualBestLapTime[i] = 0;
+    qualLapCount[i] = 0;
+    qualLapStartTime[i] = 0;
+  }
   server.send(200, "text/plain", "OK");
 }
 
 void handleStop() {
-  if (timerRunning) {
-    stopTime = millis();
-    lastLapTime = stopTime - lapStartTime;
-    timerRunning = false;
-    addLapTime(lastLapTime);
+  // Reset all car timers
+  timerRunning = false;
+  stopTime = 0;
+  lapStartTime = 0;
+  
+  // Reset all car lap start times (this will make their current lap timers show "--")
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    qualLapStartTime[i] = 0;
   }
+  
   server.send(200, "text/plain", "OK");
 }
 
@@ -1212,6 +1366,14 @@ void loop() {
       if (now - lastTriggerTime > MIN_TRIGGER_GAP_MS) {
         lastTriggerTime = now;
 
+        // Start lap timer for detected car if not already running
+        if (lastDetectedCar >= 1 && lastDetectedCar <= MAX_RACE_CARS) {
+          int carIdx = lastDetectedCar - 1;
+          if (qualLapStartTime[carIdx] == 0) {
+            qualLapStartTime[carIdx] = now;
+          }
+        }
+        
         if (!timerStartedOnce) {
           timerStartedOnce = true;
           timerRunning = true;
@@ -1220,7 +1382,25 @@ void loop() {
         } else if (timerRunning) {
           stopTime = now;
           lastLapTime = stopTime - lapStartTime;
-          addLapTime(lastLapTime);
+          
+          // Store last lap time and update best lap time for the detected car
+          int carIdForLap = 0;
+          if (lastDetectedCar >= 1 && lastDetectedCar <= MAX_RACE_CARS) {
+            carIdForLap = lastDetectedCar;
+          }
+          addLapTime(lastLapTime, carIdForLap);
+          
+          if (lastDetectedCar >= 1 && lastDetectedCar <= MAX_RACE_CARS) {
+            int carIdx = lastDetectedCar - 1;
+            qualLastLapTime[carIdx] = lastLapTime;
+            qualLapCount[carIdx]++;
+            // Update best lap if this is faster or no best lap recorded yet
+            if (qualBestLapTime[carIdx] == 0 || lastLapTime < qualBestLapTime[carIdx]) {
+              qualBestLapTime[carIdx] = lastLapTime;
+            }
+            // Start next lap timer for this car
+            qualLapStartTime[carIdx] = now;
+          }
 
           if (continuousMode) {
             lapStartTime = now;
