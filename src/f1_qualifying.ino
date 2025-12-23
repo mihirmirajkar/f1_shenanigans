@@ -576,7 +576,7 @@ if (tb) {
     if (bestLapMs > 0 && leaderBestLapMs > 0) {
       const deltaMs = bestLapMs - leaderBestLapMs;
       if (deltaMs === 0) {
-        deltaText = "--"; // Leader shows "--"
+        deltaText = "Leader"; // Leader shows "Leader" to indicate delta is based on leader
       } else {
         // Format delta without minutes: S.mmm (no leading zero padding for seconds)
         const totalSeconds = Math.floor(deltaMs / 1000);
@@ -770,6 +770,19 @@ table { width: 100%; border-collapse: collapse; margin-top: 8px; }
 th, td { border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; }
 th { background: rgba(255,255,255,0.08); }
 .car-highlight { background: rgba(41,182,246,0.18); }
+.laps-container {
+  margin-top: 20px;
+}
+.laps-title {
+  font-size: 4vw;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-bottom: 0.3em;
+  color: #ffffff;
+}
+@media (min-width: 900px) {
+  .laps-title { font-size: 1.2rem; }
+}
 .currentLapTime {
   font-family: "SF Mono","Roboto Mono",Menlo,Consolas,monospace;
   font-weight: 900;
@@ -812,6 +825,13 @@ th { background: rgba(255,255,255,0.08); }
   <div id="raceStatus">Idle</div>
   <div id="countdown">--</div>
   
+  <div style="margin-top:20px; margin-bottom: 20px;">
+    <button class="btn-start" onclick="startRace()">Start</button>
+    <button class="btn-stop" onclick="doRaceStop()">Stop</button>
+    <button class="btn-finish" onclick="finishRace()">Reset</button>
+    <button class="btn-back" onclick="location.href='/'">Back to Quali</button>
+  </div>
+  
   <div style="margin-top:20px;">
     <table id="raceCarTable" style="width: 100%; border-collapse: collapse; margin-top: 6px;">
       <thead>
@@ -830,10 +850,19 @@ th { background: rgba(255,255,255,0.08); }
     </table>
   </div>
 
-  <button class="btn-start" onclick="startRace()">Start</button>
-  <button class="btn-stop" onclick="doRaceStop()">Stop</button>
-  <button class="btn-finish" onclick="finishRace()">Reset</button>
-  <button class="btn-back" onclick="location.href='/'">Back to Quali</button>
+  <div class="laps-container" style="margin-top: 20px;">
+    <div class="laps-title">Lap Times (Last 50)</div>
+    <table style="width: 100%; border-collapse: collapse; margin-top: 6px;">
+      <thead>
+        <tr>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Car</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Lap</th>
+          <th style="border: 1px solid rgba(255,255,255,0.2); padding: 8px; font-size: 14px; background: rgba(255,255,255,0.08);">Time</th>
+        </tr>
+      </thead>
+      <tbody id="raceLapsBody"></tbody>
+    </table>
+  </div>
 
   <audio id="goAudio" preload="auto">
   </audio>
@@ -847,6 +876,8 @@ th { background: rgba(255,255,255,0.08); }
     let isFinished = false;
     let targetLaps = 5;
     let lastRaceStatusUpdate = 0;
+    let lastWinnerCar = 0;
+    let carsInFinalLap = new Set(); // Track which cars have entered final lap
     
     function formatTime(ms) {
       const totalSeconds = Math.floor(ms / 1000);
@@ -896,15 +927,30 @@ th { background: rgba(255,255,255,0.08); }
         const data = await res.json();
 
         document.getElementById('raceStatus').innerText = data.phaseText;
-        document.getElementById('countdown').innerText = data.display;
+        const countdownEl = document.getElementById('countdown');
+        countdownEl.innerText = data.display;
+        // Hide countdown once race has started (after GO!)
+        if (data.phaseText === 'GO!') {
+          countdownEl.style.display = 'none';
+        } else {
+          countdownEl.style.display = 'block';
+        }
         
         // Show winner if we have one
         if (data.winnerCar && data.winnerCar > 0) {
           document.getElementById('winnerDisplay').style.display = 'block';
           document.getElementById('winnerText').innerText = 'Car ' + data.winnerCar + ' wins!';
+          
+          // Play finish audio when winner is first detected
+          if (lastWinnerCar === 0 && data.winnerCar > 0) {
+            goAudio.src = '/finish.mp3';
+            goAudio.currentTime = 0;
+            goAudio.play().catch(e => console.log('Finish audio play failed:', e));
+          }
         } else {
           document.getElementById('winnerDisplay').style.display = 'none';
         }
+        lastWinnerCar = data.winnerCar || 0;
         
         // Update target laps from server
         if (data.targetLaps) {
@@ -987,6 +1033,30 @@ th { background: rgba(255,255,255,0.08); }
             }
           }
           
+          // Check for cars entering final lap (lapCount == targetLaps - 1)
+          // Play final_lap.mp3 when the first car enters their final lap
+          for (let c = 1; c <= 6; c++) {
+            const lapCount = lapCounts[c - 1] || 0;
+            if (lapCount === targetLaps - 1 && !carsInFinalLap.has(c)) {
+              // First car entering final lap - play audio
+              if (carsInFinalLap.size === 0) {
+                goAudio.src = '/final_lap.mp3';
+                goAudio.currentTime = 0;
+                goAudio.play().catch(e => console.log('Final lap audio play failed:', e));
+              }
+              carsInFinalLap.add(c);
+            }
+          }
+          
+          // Find the fastest best lap time (smallest time = fastest)
+          let fastestBestLapMs = Infinity;
+          for (let c = 1; c <= 6; c++) {
+            const bestLapMs = bestLapTimes[c - 1] || 0;
+            if (bestLapMs > 0 && bestLapMs < fastestBestLapMs) {
+              fastestBestLapMs = bestLapMs;
+            }
+          }
+          
           let html = "";
           // Sort cars by position for display
           const carsToDisplay = [];
@@ -1028,12 +1098,18 @@ th { background: rgba(255,255,255,0.08); }
             // Last lap
             const lastLapText = (lastLapMs > 0) ? formatTime(lastLapMs) : "--";
             
-            // Best lap
-            const bestLapText = (bestLapMs > 0) ? formatTime(bestLapMs) : "--";
+            // Best lap (add clock icon if this is the fastest best lap)
+            let bestLapText = (bestLapMs > 0) ? formatTime(bestLapMs) : "--";
+            if (bestLapMs > 0 && bestLapMs === fastestBestLapMs) {
+              bestLapText += " ⏱️";
+            }
             
             // Delta (only show if car has completed target laps)
             let deltaText = "--";
-            if (isStopped && deltaMs !== undefined && deltaMs >= 0) {
+            if (pos === 1) {
+              // First car shows "Interval" to indicate delta is based on car in front
+              deltaText = "Interval";
+            } else if (isStopped && deltaMs !== undefined && deltaMs >= 0) {
               const totalSeconds = Math.floor(deltaMs / 1000);
               const seconds = totalSeconds % 60;
               const millisPart = deltaMs % 1000;
@@ -1047,6 +1123,9 @@ th { background: rgba(255,255,255,0.08); }
           }
           raceTableBody.innerHTML = html;
           lastRaceStatusUpdate = clientNow;
+          
+          // Render last 50 laps table
+          renderRaceLaps(data.lapTimes || [], lapCounts || []);
         }
 
         // Play audio when phase changes to GO!
@@ -1097,7 +1176,79 @@ th { background: rgba(255,255,255,0.08); }
       goAudio.play().catch(e => console.log('Random audio play failed:', e));
     }
 
+    function renderRaceLaps(lapTimesArray, lapCounts) {
+      const body = document.getElementById('raceLapsBody');
+      if (!body) return;
+      body.innerHTML = "";
+
+      // Flatten lap times into chronological list (newest first)
+      // lapTimesArray is [car1_laps[], car2_laps[], ...]
+      const allLaps = [];
+      for (let carId = 1; carId <= 6; carId++) {
+        const carLaps = lapTimesArray[carId - 1] || [];
+        const carLapCount = lapCounts[carId - 1] || 0;
+        
+        // Add each lap with car ID and lap number
+        for (let i = 0; i < carLaps.length && i < carLapCount; i++) {
+          const lapTime = carLaps[i];
+          if (lapTime > 0) {
+            // Calculate lap number (newest lap = carLapCount, oldest = 1)
+            const lapNum = carLapCount - i;
+            allLaps.push({
+              carId: carId,
+              lapNum: lapNum,
+              time: lapTime,
+              timestamp: carLapCount - i // Use lap number as timestamp for sorting
+            });
+          }
+        }
+      }
+
+      // Sort by timestamp descending (newest first), then by car ID
+      allLaps.sort((a, b) => {
+        if (b.timestamp !== a.timestamp) {
+          return b.timestamp - a.timestamp; // Newest first
+        }
+        return a.carId - b.carId; // Then by car ID
+      });
+
+      // Take only the last 50 laps
+      const last50Laps = allLaps.slice(0, 50);
+
+      // Render the table
+      for (let i = 0; i < last50Laps.length; i++) {
+        const lap = last50Laps[i];
+        const tr = document.createElement('tr');
+
+        const tdCar = document.createElement('td');
+        tdCar.textContent = "#" + lap.carId;
+
+        const tdLap = document.createElement('td');
+        tdLap.textContent = lap.lapNum;
+
+        const tdTime = document.createElement('td');
+        tdTime.textContent = formatTime(lap.time);
+
+        tr.appendChild(tdCar);
+        tr.appendChild(tdLap);
+        tr.appendChild(tdTime);
+        body.appendChild(tr);
+      }
+    }
+
     async function doRaceStop() {
+      // Stop random commentaries
+      if (randomInterval) {
+        clearInterval(randomInterval);
+        randomInterval = null;
+      }
+      if (randomTimeout) {
+        clearTimeout(randomTimeout);
+        randomTimeout = null;
+      }
+      goAudio.onended = null;
+      goAudio.pause();
+      
       await fetch('/race_stop');
       setTimeout(fetchRaceStatus, 150);
     }
@@ -1114,6 +1265,8 @@ th { background: rgba(255,255,255,0.08); }
       }
       goAudio.onended = null;
       goAudio.pause();
+      // Reset final lap tracking
+      carsInFinalLap.clear();
       await fetch('/race_finish');
       setTimeout(fetchRaceStatus, 150);
     }
@@ -1568,6 +1721,10 @@ void setup() {
     String route = "/random_" + String(i) + ".mp3";
     server.on(route.c_str(), handleMP3);
   }
+  // Register finish audio
+  server.on("/finish.mp3", handleMP3);
+  // Register final lap audio
+  server.on("/final_lap.mp3", handleMP3);
 
   server.begin();
   Serial.println("HTTP server started.");
