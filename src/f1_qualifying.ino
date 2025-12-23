@@ -563,11 +563,11 @@ if (tb) {
       if (deltaMs === 0) {
         deltaText = "--"; // Leader shows "--"
       } else {
-        // Format delta without minutes: SS.mmm
+        // Format delta without minutes: S.mmm (no leading zero padding for seconds)
         const totalSeconds = Math.floor(deltaMs / 1000);
         const seconds = totalSeconds % 60;
         const millisPart = deltaMs % 1000;
-        deltaText = "+" + String(seconds).padStart(2, '0') + "." + String(millisPart).padStart(3, '0');
+        deltaText = "+" + String(seconds) + "." + String(millisPart).padStart(3, '0');
       }
     }
     
@@ -973,6 +973,9 @@ void handleStatus() {
   unsigned long now = millis();
   unsigned long currentTimeMs = 0;
 
+  // For qualifying mode, we don't use the global timer anymore
+  // Each car has its own timer via qualLapStartTime[]
+  // Keep this for backward compatibility but it's not used for per-car timing
   if (timerRunning) {
     currentTimeMs = now - lapStartTime;
   } else if (timerStartedOnce && stopTime > lapStartTime) {
@@ -981,13 +984,20 @@ void handleStatus() {
     currentTimeMs = 0;
   }
 
+  // Check if any car has an active timer
+  bool anyCarRunning = false;
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    if (qualLapStartTime[i] > 0) {
+      anyCarRunning = true;
+      break;
+    }
+  }
+
   String status;
-  if (!timerStartedOnce) {
+  if (!anyCarRunning) {
     status = "WAITING FOR FIRST PASS";
-  } else if (timerRunning) {
-    status = "RUNNING";
   } else {
-    status = "FINISHED";
+    status = "RUNNING";
   }
 
   String modeStr = continuousMode ? "continuous" : "outlap";
@@ -1366,56 +1376,45 @@ void loop() {
       if (now - lastTriggerTime > MIN_TRIGGER_GAP_MS) {
         lastTriggerTime = now;
 
-        // Start lap timer for detected car if not already running
+        // Handle per-car lap timing (independent for each car)
         if (lastDetectedCar >= 1 && lastDetectedCar <= MAX_RACE_CARS) {
           int carIdx = lastDetectedCar - 1;
+          
           if (qualLapStartTime[carIdx] == 0) {
+            // First pass for this car - just start their timer, don't count as a lap
             qualLapStartTime[carIdx] = now;
-          }
-        }
-        
-        if (!timerStartedOnce) {
-          timerStartedOnce = true;
-          timerRunning = true;
-          lapStartTime = now;
-          Serial.println("First pass detected. Lap timing started.");
-        } else if (timerRunning) {
-          stopTime = now;
-          lastLapTime = stopTime - lapStartTime;
-          
-          // Store last lap time and update best lap time for the detected car
-          int carIdForLap = 0;
-          if (lastDetectedCar >= 1 && lastDetectedCar <= MAX_RACE_CARS) {
-            carIdForLap = lastDetectedCar;
-          }
-          addLapTime(lastLapTime, carIdForLap);
-          
-          if (lastDetectedCar >= 1 && lastDetectedCar <= MAX_RACE_CARS) {
-            int carIdx = lastDetectedCar - 1;
-            qualLastLapTime[carIdx] = lastLapTime;
-            qualLapCount[carIdx]++;
-            // Update best lap if this is faster or no best lap recorded yet
-            if (qualBestLapTime[carIdx] == 0 || lastLapTime < qualBestLapTime[carIdx]) {
-              qualBestLapTime[carIdx] = lastLapTime;
-            }
-            // Start next lap timer for this car
-            qualLapStartTime[carIdx] = now;
-          }
-
-          if (continuousMode) {
-            lapStartTime = now;
-            timerRunning = true;
-            Serial.print("Lap complete (continuous). Lap time (ms): ");
-            Serial.println(lastLapTime);
+            Serial.print("Car ");
+            Serial.print(lastDetectedCar);
+            Serial.println(" first pass detected. Lap timing started.");
           } else {
-            timerRunning = false;
-            Serial.print("Lap complete (out lap). Lap time (ms): ");
-            Serial.println(lastLapTime);
+            // This car has a running lap - complete it
+            unsigned long lapTime = now - qualLapStartTime[carIdx];
+            
+            // Store the lap time
+            qualLastLapTime[carIdx] = lapTime;
+            qualLapCount[carIdx]++;
+            
+            // Update best lap if this is faster or no best lap recorded yet
+            if (qualBestLapTime[carIdx] == 0 || lapTime < qualBestLapTime[carIdx]) {
+              qualBestLapTime[carIdx] = lapTime;
+            }
+            
+            // Add to lap history
+            addLapTime(lapTime, lastDetectedCar);
+            
+            Serial.print("Car ");
+            Serial.print(lastDetectedCar);
+            Serial.print(" lap complete. Lap time (ms): ");
+            Serial.println(lapTime);
+            
+            // Start next lap for this car (if continuous mode, or always for qualifying)
+            if (continuousMode) {
+              qualLapStartTime[carIdx] = now;
+            } else {
+              // Out lap mode - stop timer for this car
+              qualLapStartTime[carIdx] = 0;
+            }
           }
-        } else {
-          timerRunning = true;
-          lapStartTime = now;
-          Serial.println("New lap started.");
         }
       }
     }
