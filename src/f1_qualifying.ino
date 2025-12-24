@@ -65,10 +65,12 @@ unsigned long raceLastLapTime[MAX_RACE_CARS] = {0}; // Last lap time per car
 unsigned long raceBestLapTime[MAX_RACE_CARS] = {0}; // Best lap time per car
 unsigned long raceCurrentLapStartMs[MAX_RACE_CARS] = {0}; // Current lap start time per car
 unsigned long raceLastSensorCrossMs[MAX_RACE_CARS] = {0}; // Last sensor crossing time for delta calculation
+bool raceFinishedByCheckeredFlag[MAX_RACE_CARS] = {false}; // Whether car was finished by checkered flag (didn't complete all laps)
 
 int raceTargetLaps = 5;     // Target laps to complete (default 5)
 int raceWinnerCar = 0;      // 0 = no winner yet, 1-6 = winning car
 unsigned long raceWinTimeMs = 0; // Time when winner finished
+unsigned long raceStartTimeMs = 0; // Time when race started (lights go out / RACE_GO_DONE begins)
 
 volatile int lastDetectedCar = 0;        // 1..6
 volatile int lastDetectedSlits = -1;     // 0..5
@@ -146,12 +148,14 @@ void resetRaceStats() {
     raceBestLapTime[i] = 0;
     raceCurrentLapStartMs[i] = 0;
     raceLastSensorCrossMs[i] = 0;
+    raceFinishedByCheckeredFlag[i] = false;
     for (int j = 0; j < MAX_RACE_LAPS_PER_CAR; j++) {
       raceLapTimes[i][j] = 0;
     }
   }
   raceWinnerCar = 0;
   raceWinTimeMs = 0;
+  raceStartTimeMs = 0;
   lastDetectedCar = 0;
   lastDetectedSlits = -1;
   lastDetectedAtMs = 0;
@@ -868,12 +872,13 @@ th { background: rgba(255,255,255,0.08); }
   </audio>
 
   <script>
-    const goAudio = document.getElementById('goAudio');
+    let goAudio = null;
     let lastPhase = '';
     let audioUnlocked = false;
     let randomInterval = null;
     let randomTimeout = null;
     let isFinished = false;
+    let randomCommentaryStopped = false; // Track if random commentary should be stopped (when first car enters final lap)
     let targetLaps = 5;
     let lastRaceStatusUpdate = 0;
     let lastWinnerCar = 0;
@@ -908,23 +913,41 @@ th { background: rgba(255,255,255,0.08); }
 
 
     async function startRace() {
-      goAudio.src = '/lights_out_' + (Math.floor(Math.random() * 8) + 1) + '.mp3';
-      if (!audioUnlocked) {
-        try {
-          await goAudio.play();
-          goAudio.pause();
-          goAudio.currentTime = 0;
-          audioUnlocked = true;
-        } catch (e) {}
+      console.log('Start race button clicked');
+      // Reset random commentary flag for new race
+      randomCommentaryStopped = false;
+      if (goAudio) {
+        goAudio.src = '/lights_out_' + (Math.floor(Math.random() * 8) + 1) + '.mp3';
+        if (!audioUnlocked) {
+          try {
+            await goAudio.play();
+            goAudio.pause();
+            goAudio.currentTime = 0;
+            audioUnlocked = true;
+          } catch (e) {}
+        }
       }
-      await fetch('/race_start');
+      try {
+        const response = await fetch('/race_start');
+        console.log('Race start response:', response.status, response.statusText);
+        if (!response.ok) {
+          console.error('Race start failed:', response.status, response.statusText);
+        }
+      } catch (e) {
+        console.error('Error starting race:', e);
+      }
       setTimeout(fetchRaceStatus, 150);
     }
 
     async function fetchRaceStatus() {
       try {
         const res = await fetch('/race_status');
+        if (!res.ok) {
+          console.error('Race status fetch failed:', res.status, res.statusText);
+          return;
+        }
         const data = await res.json();
+        console.log('Race status:', data.phaseText, data.display);
 
         document.getElementById('raceStatus').innerText = data.phaseText;
         const countdownEl = document.getElementById('countdown');
@@ -969,6 +992,9 @@ th { background: rgba(255,255,255,0.08); }
           const lastSensorCrossTimes = data.lastSensorCrossTimes || [];
           const totalTimeStopped = data.totalTimeStopped || [];
           const totalStartTimes = data.totalStartTimes || [];
+          const raceStartTimeMs = data.raceStartTimeMs || 0; // Global race start time (when lights go out)
+          const finishedByCheckeredFlag = data.finishedByCheckeredFlag || [];
+          const remainingLaps = data.remainingLaps || [];
           const serverNow = data.serverNowMs || 0;
           lastServerNow = serverNow;
           const clientNow = Date.now();
@@ -1007,14 +1033,14 @@ th { background: rgba(255,255,255,0.08); }
             positions[carsWithPosition[i].car] = i + 1;
           }
           
-          // Calculate deltas based on total time (only for cars that completed target laps)
+          // Calculate deltas based on total time (for cars that completed target laps or were finished by checkered flag)
           const deltas = {};
           for (let c = 1; c <= 6; c++) {
             const myPos = positions[c];
             const isStopped = totalTimeStopped[c - 1];
             const myTotalTime = totalTimes[c - 1] || 0;
             
-            // Only calculate delta if car has completed target laps (timer stopped)
+            // Calculate delta if car has finished (timer stopped) - either completed all laps or finished by checkered flag
             if (isStopped && myTotalTime > 0 && myPos && myPos > 1) {
               // Find the car directly in front (position = myPos - 1)
               for (let other = 1; other <= 6; other++) {
@@ -1023,7 +1049,7 @@ th { background: rgba(255,255,255,0.08); }
                 if (otherPos === myPos - 1) {
                   const otherTotalTime = totalTimes[other - 1] || 0;
                   const otherStopped = totalTimeStopped[other - 1];
-                  // Only calculate if car ahead has also finished
+                  // Only calculate if car ahead has also finished (completed all laps or finished by checkered flag)
                   if (otherStopped && otherTotalTime > 0) {
                     deltas[c] = myTotalTime - otherTotalTime;
                     break;
@@ -1035,11 +1061,22 @@ th { background: rgba(255,255,255,0.08); }
           
           // Check for cars entering final lap (lapCount == targetLaps - 1)
           // Play final_lap.mp3 when the first car enters their final lap
+          // Stop random commentary when first car enters final lap
           for (let c = 1; c <= 6; c++) {
             const lapCount = lapCounts[c - 1] || 0;
             if (lapCount === targetLaps - 1 && !carsInFinalLap.has(c)) {
-              // First car entering final lap - play audio
+              // First car entering final lap - play audio and stop random commentary
               if (carsInFinalLap.size === 0) {
+                // Stop random commentary
+                randomCommentaryStopped = true;
+                if (randomTimeout) {
+                  clearTimeout(randomTimeout);
+                  randomTimeout = null;
+                }
+                // Clear the onended callback to prevent new random commentary from starting
+                goAudio.onended = null;
+                
+                // Play final lap audio
                 goAudio.src = '/final_lap.mp3';
                 goAudio.currentTime = 0;
                 goAudio.play().catch(e => console.log('Final lap audio play failed:', e));
@@ -1077,21 +1114,24 @@ th { background: rgba(255,255,255,0.08); }
             const deltaMs = deltas[c];
             const pos = positions[c];
             
-            // Current lap time (only show if car hasn't completed target laps)
+            // Current lap time (only show if car hasn't completed target laps and wasn't finished by checkered flag)
+            const finishedByFlag = finishedByCheckeredFlag[c - 1];
             let currentLapText = "--";
-            if (currentLapStart > 0 && data.phaseText === 'GO!' && lapCount < targetLaps) {
+            if (currentLapStart > 0 && data.phaseText === 'GO!' && lapCount < targetLaps && !finishedByFlag) {
               const currentLapMs = estimatedServerNow - currentLapStart;
               currentLapText = formatTime(currentLapMs);
             }
             
             // Total time (will be updated in real-time by animation loop)
-            const totalStartTime = totalStartTimes[c - 1] || 0;
+            // Total time starts from race start (lights go out), but only show if car has passed sensor
+            const carFirstPassTime = totalStartTimes[c - 1] || 0; // When car first passed sensor (for display logic)
             let totalTimeText = "--";
             if (isStopped && totalTimeMs > 0) {
               totalTimeText = formatTime(totalTimeMs) + " 🏁";
-            } else if (data.phaseText === 'GO!' && totalStartTime > 0) {
+            } else if (data.phaseText === 'GO!' && raceStartTimeMs > 0 && carFirstPassTime > 0) {
               // Show initial value, will be updated smoothly by animation loop
-              const initialTotalMs = estimatedServerNow - totalStartTime;
+              // Use race start time (when lights go out), not when car first passed sensor
+              const initialTotalMs = estimatedServerNow - raceStartTimeMs;
               totalTimeText = formatTime(initialTotalMs);
             }
             
@@ -1104,12 +1144,29 @@ th { background: rgba(255,255,255,0.08); }
               bestLapText += " ⏱️";
             }
             
-            // Delta (only show if car has completed target laps)
+            // Delta logic: show "+N lap(s)" for cars finished by checkered flag, otherwise show time delta
             let deltaText = "--";
+            // finishedByFlag already declared above
+            const remaining = remainingLaps[c - 1] || 0;
+            
             if (pos === 1) {
               // First car shows "Interval" to indicate delta is based on car in front
               deltaText = "Interval";
+            } else if (finishedByFlag && remaining > 0) {
+              // Car was finished by checkered flag - show remaining laps
+              let lapsText = "+" + String(remaining) + (remaining === 1 ? " lap" : " laps");
+              // Add time delta in parentheses if available
+              if (deltaMs !== undefined && deltaMs >= 0) {
+                const totalSeconds = Math.floor(deltaMs / 1000);
+                const seconds = totalSeconds % 60;
+                const millisPart = deltaMs % 1000;
+                const timeDeltaText = "+" + String(seconds) + "." + String(millisPart).padStart(3, '0');
+                deltaText = lapsText + " (" + timeDeltaText + ")";
+              } else {
+                deltaText = lapsText;
+              }
             } else if (isStopped && deltaMs !== undefined && deltaMs >= 0) {
+              // Car completed all laps - show time delta
               const totalSeconds = Math.floor(deltaMs / 1000);
               const seconds = totalSeconds % 60;
               const millisPart = deltaMs % 1000;
@@ -1119,7 +1176,7 @@ th { background: rgba(255,255,255,0.08); }
             // Position
             const posText = (pos !== undefined) ? "P" + pos : "--";
             
-            html += `<tr><td>#${c}</td><td>${lapCount}</td><td class="currentLapTime" data-start="${currentLapStart}">${currentLapText}</td><td>${lastLapText}</td><td class="bestLapTime">${bestLapText}</td><td class="totalTime" data-total="${totalTimeMs}" data-total-start="${totalStartTime}" data-stopped="${isStopped}">${totalTimeText}</td><td>${deltaText}</td><td>${posText}</td></tr>`;
+            html += `<tr><td>#${c}</td><td>${lapCount}</td><td class="currentLapTime" data-start="${currentLapStart}">${currentLapText}</td><td>${lastLapText}</td><td class="bestLapTime">${bestLapText}</td><td class="totalTime" data-total="${totalTimeMs}" data-total-start="${raceStartTimeMs}" data-car-passed="${carFirstPassTime > 0 ? 'true' : 'false'}" data-stopped="${isStopped}">${totalTimeText}</td><td>${deltaText}</td><td>${posText}</td></tr>`;
           }
           raceTableBody.innerHTML = html;
           lastRaceStatusUpdate = clientNow;
@@ -1147,9 +1204,9 @@ th { background: rgba(255,255,255,0.08); }
             goAudio.src = '/turn_one_' + (Math.floor(Math.random() * 8) + 1) + '.mp3';
             goAudio.currentTime = 0;
             goAudio.onended = () => {
-              if (isFinished) return;
+              if (isFinished || randomCommentaryStopped) return;
               randomTimeout = setTimeout(() => {
-                if (isFinished) return;
+                if (isFinished || randomCommentaryStopped) return;
                 playRandom();
               }, 15000);
             };
@@ -1158,18 +1215,18 @@ th { background: rgba(255,255,255,0.08); }
         }
         lastPhase = data.phaseText;
       } catch (e) {
-        console.error('Fetch error:', e);
+        console.error('Fetch race status error:', e);
       }
     }
 
     function playRandom() {
-      if (isFinished) return;
+      if (isFinished || randomCommentaryStopped) return;
       goAudio.src = '/random_' + (Math.floor(Math.random() * 17) + 1) + '.mp3';
       goAudio.currentTime = 0;
       goAudio.onended = () => {
-        if (isFinished) return;
+        if (isFinished || randomCommentaryStopped) return;
         randomTimeout = setTimeout(() => {
-          if (isFinished) return;
+          if (isFinished || randomCommentaryStopped) return;
           playRandom();
         }, 15000);
       };
@@ -1265,8 +1322,9 @@ th { background: rgba(255,255,255,0.08); }
       }
       goAudio.onended = null;
       goAudio.pause();
-      // Reset final lap tracking
+      // Reset final lap tracking and random commentary flag
       carsInFinalLap.clear();
+      randomCommentaryStopped = false;
       await fetch('/race_finish');
       setTimeout(fetchRaceStatus, 150);
     }
@@ -1304,12 +1362,17 @@ th { background: rgba(255,255,255,0.08); }
         }
         
         // Update total time smoothly (like current lap timer)
+        // Only show total time if car has passed sensor at least once
         const totalTimeCell = row.querySelector('.totalTime');
         if (totalTimeCell) {
+          const carPassed = totalTimeCell.getAttribute('data-car-passed') === 'true';
           const isStopped = totalTimeCell.getAttribute('data-stopped') === 'true';
           const totalStartTime = parseInt(totalTimeCell.getAttribute('data-total-start')) || 0;
           
-          if (isStopped) {
+          if (!carPassed) {
+            // Car hasn't passed sensor yet - show "--"
+            totalTimeCell.textContent = "--";
+          } else if (isStopped) {
             // Timer has stopped - use stored value and show checkered flag
             const totalTimeMs = parseInt(totalTimeCell.getAttribute('data-total')) || 0;
             if (totalTimeMs > 0) {
@@ -1336,6 +1399,24 @@ th { background: rgba(255,255,255,0.08); }
     }
     
     let lastServerNow = 0;
+    
+    // Initialize audio element
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', function() {
+        goAudio = document.getElementById('goAudio');
+      });
+    } else {
+      goAudio = document.getElementById('goAudio');
+    }
+    
+    // Make sure functions are in global scope
+    window.startRace = startRace;
+    window.doRaceStop = doRaceStop;
+    window.finishRace = finishRace;
+    window.setTargetLaps = setTargetLaps;
+    
+    console.log('Race page script loaded, startRace defined:', typeof startRace);
+    
     setInterval(fetchRaceStatus, 150);
     fetchRaceStatus();
     requestAnimationFrame(updateRaceTimers);
@@ -1494,8 +1575,9 @@ void handleRaceStop() {
     raceCurrentLapStartMs[i] = 0;
     
     // Stop total time timer if it's running (but don't reset it)
+    // Total time is calculated from race start (lights go out), not from when car first passed sensor
     if (raceTotalStartMs[i] > 0 && !raceTotalTimeStopped[i]) {
-      raceTotalTimeMs[i] = now - raceTotalStartMs[i];
+      raceTotalTimeMs[i] = now - raceStartTimeMs;
       raceTotalTimeStopped[i] = true;
     }
   }
@@ -1572,21 +1654,28 @@ void handleRaceStatus() {
   }
 
   // Calculate total times (update if not stopped)
+  // Total time starts from when lights go out (raceStartTimeMs), not when car first passes sensor
   unsigned long raceTotalTimes[MAX_RACE_CARS];
   for (int i = 0; i < MAX_RACE_CARS; i++) {
     if (raceTotalTimeStopped[i]) {
       raceTotalTimes[i] = raceTotalTimeMs[i];
-    } else if (raceTotalStartMs[i] > 0 && racePhase == RACE_GO_DONE) {
-      raceTotalTimes[i] = now - raceTotalStartMs[i];
+    } else if (raceStartTimeMs > 0 && racePhase == RACE_GO_DONE) {
+      // Only show total time if car has passed sensor at least once (raceTotalStartMs[i] > 0)
+      // But calculate from race start time, not from when car first passed sensor
+      if (raceTotalStartMs[i] > 0) {
+        raceTotalTimes[i] = now - raceStartTimeMs;
+      } else {
+        raceTotalTimes[i] = 0;
+      }
     } else {
       raceTotalTimes[i] = 0;
     }
   }
   
-  // Calculate current lap times (only if car hasn't completed target laps)
+  // Calculate current lap times (only if car hasn't completed target laps and wasn't finished by checkered flag)
   unsigned long raceCurrentLapTimes[MAX_RACE_CARS];
   for (int i = 0; i < MAX_RACE_CARS; i++) {
-    if (raceCurrentLapStartMs[i] > 0 && racePhase == RACE_GO_DONE && raceLapCount[i] < raceTargetLaps) {
+    if (raceCurrentLapStartMs[i] > 0 && racePhase == RACE_GO_DONE && raceLapCount[i] < raceTargetLaps && !raceFinishedByCheckeredFlag[i]) {
       raceCurrentLapTimes[i] = now - raceCurrentLapStartMs[i];
     } else {
       raceCurrentLapTimes[i] = 0;
@@ -1601,6 +1690,7 @@ void handleRaceStatus() {
   json += "\"lastAtMs\":" + String(lastDetectedAtMs) + ",";
   json += "\"targetLaps\":" + String(raceTargetLaps) + ",";
   json += "\"winnerCar\":" + String(raceWinnerCar) + ",";
+  json += "\"raceStartTimeMs\":" + String(raceStartTimeMs) + ",";
   json += "\"serverNowMs\":" + String(now) + ",";
 
   json += "\"lapCount\":[";
@@ -1652,6 +1742,17 @@ void handleRaceStatus() {
   json += "],\"totalTimeStopped\":[";
   for (int i = 0; i < MAX_RACE_CARS; i++) {
     json += String(raceTotalTimeStopped[i] ? "true" : "false");
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"finishedByCheckeredFlag\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    json += String(raceFinishedByCheckeredFlag[i] ? "true" : "false");
+    if (i < MAX_RACE_CARS - 1) json += ",";
+  }
+  json += "],\"remainingLaps\":[";
+  for (int i = 0; i < MAX_RACE_CARS; i++) {
+    int remaining = (raceTargetLaps > raceLapCount[i]) ? (raceTargetLaps - raceLapCount[i]) : 0;
+    json += String(remaining);
     if (i < MAX_RACE_CARS - 1) json += ",";
   }
   json += "]";
@@ -1813,7 +1914,8 @@ void loop() {
                 
                 // Check if this car just completed target laps - stop total timer and current lap timer
                 if (raceLapCount[ci] >= raceTargetLaps && !raceTotalTimeStopped[ci]) {
-                  raceTotalTimeMs[ci] = now - raceTotalStartMs[ci];
+                  // Total time is calculated from race start (lights go out), not from when car first passed sensor
+                  raceTotalTimeMs[ci] = now - raceStartTimeMs;
                   raceTotalTimeStopped[ci] = true;
                   raceCurrentLapStartMs[ci] = 0; // Stop current lap timer
                 }
@@ -1830,8 +1932,22 @@ void loop() {
             raceLastCrossMs[ci] = now;
             raceLastSensorCrossMs[ci] = now; // For delta calculation
             
-            // Only start/update current lap timer if car hasn't completed target laps
-            if (raceLapCount[ci] < raceTargetLaps) {
+            // Checkered flag behavior: if winner has finished and this car hasn't completed all laps,
+            // finish this car on their next crossing (real F1 behavior)
+            if (raceWinnerCar > 0 && raceLapCount[ci] < raceTargetLaps && !raceFinishedByCheckeredFlag[ci]) {
+              // This car is being finished by checkered flag
+              raceFinishedByCheckeredFlag[ci] = true;
+              // Stop total timer and current lap timer
+              // Total time is calculated from race start (lights go out), not from when car first passed sensor
+              if (raceTotalStartMs[ci] > 0 && !raceTotalTimeStopped[ci]) {
+                raceTotalTimeMs[ci] = now - raceStartTimeMs;
+                raceTotalTimeStopped[ci] = true;
+              }
+              raceCurrentLapStartMs[ci] = 0; // Stop current lap timer
+            }
+            
+            // Only start/update current lap timer if car hasn't completed target laps and wasn't finished by checkered flag
+            if (raceLapCount[ci] < raceTargetLaps && !raceFinishedByCheckeredFlag[ci]) {
               raceCurrentLapStartMs[ci] = now; // Start/update current lap timer
             }
           }
@@ -1961,6 +2077,7 @@ void loop() {
         // Lights out, GO!
         allLightsOff();
         racePhase = RACE_GO_DONE;
+        raceStartTimeMs = now; // Record when race actually started (lights go out)
         Serial.println("LIGHTS OUT! GO!");
       }
       break;
